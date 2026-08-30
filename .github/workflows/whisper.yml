@@ -54,6 +54,14 @@ jobs:
           # 🔴 NO -DGGML_NATIVE. It compiles for the MACHINE DOING THE BUILD, which here is an x86_64 runner
           # — the resulting binary would carry instructions an ARM64 CPU cannot execute, and would fail at
           # load on the only machine it is for. Cross builds must always turn it off.
+          #
+          # 🔴 CMAKE_SHARED_LIBRARY_PREFIX="" BECAUSE THE ARTIFACT MUST BE SHAPED LIKE UPSTREAM'S. mingw
+          # prefixes shared libraries with `lib`, MSVC does not — so the first build produced
+          # `libwhisper.dll` while upstream's whisper-bin-x64.zip carries `whisper.dll`. MasterTask's recipe
+          # names `entrypoint: whisper.dll` for every platform, so the ARM64 artifact would have installed,
+          # hashed and verified perfectly and then failed to load on the only machine it exists for.
+          # Setting the prefix at CONFIGURE time rather than renaming afterwards keeps every DLL's import
+          # table consistent with the filenames beside it.
           cmake -S src -B build \
             -DCMAKE_SYSTEM_NAME=Windows \
             -DCMAKE_SYSTEM_PROCESSOR=ARM64 \
@@ -62,6 +70,7 @@ jobs:
             -DCMAKE_RC_COMPILER=aarch64-w64-mingw32-windres \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_SHARED_LIBRARY_PREFIX="" \
             -DGGML_NATIVE=OFF \
             -DWHISPER_BUILD_TESTS=OFF \
             -DWHISPER_BUILD_EXAMPLES=OFF
@@ -75,13 +84,21 @@ jobs:
           # (ggml.dll, ggml-base.dll, ggml-cpu.dll); shipping whisper.dll alone produces an artifact that
           # loads on the build machine — where the others sit beside it — and fails on a customer's with a
           # missing-dependency error naming a library they have never heard of.
-          find build -name '*.dll' -exec cp {} dist/ \;
-          ls -la dist
-          test -f dist/whisper.dll || { echo "whisper.dll was not produced"; exit 1; }
-          # A quick proof the bytes really are ARM64 and not a silently-native x86 build.
-          file dist/whisper.dll
-          file dist/whisper.dll | grep -qi "aarch64\|ARM64" || { echo "whisper.dll is NOT an ARM64 binary"; exit 1; }
-          cp src/LICENSE dist/LICENSE.txt
+          # 🔴 UNDER `Release/`, BECAUSE THAT IS THE SHAPE UPSTREAM SHIPS AND THE RECIPE STRIPS. The x64
+          # zip is `Release/whisper.dll`, and MasterTask's recipe carries `strip: 1` for it. A flat zip here
+          # would need a different strip for one platform — a per-platform special case in a data file, and
+          # the kind that is only discovered when a customer's install produces an empty directory.
+          mkdir -p dist/Release
+          find build -name '*.dll' -exec cp {} dist/Release/ \;
+          ls -la dist/Release
+          test -f dist/Release/whisper.dll || { echo "whisper.dll was not produced — check CMAKE_SHARED_LIBRARY_PREFIX"; exit 1; }
+          # 🔴 PROOF THE BYTES ARE REALLY ARM64. A cross build that silently fell back to the host compiler
+          # produces a working x86_64 DLL that passes every other check here and fails on the only machine
+          # it is for. `file` is the cheapest thing that can tell the difference.
+          file dist/Release/whisper.dll
+          file dist/Release/whisper.dll | grep -qiE "aarch64|arm64" || {
+            echo "whisper.dll is NOT an ARM64 binary — the cross compiler was not used"; exit 1; }
+          cp src/LICENSE dist/Release/LICENSE.txt
           cd dist && zip -r ../whisper-bin-arm64.zip . && cd ..
 
       - name: publish
