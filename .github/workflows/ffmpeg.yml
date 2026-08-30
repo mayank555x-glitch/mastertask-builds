@@ -10,9 +10,21 @@
 # designed for use inside closed commercial software. Every other ffmpeg the catalog could have shipped on
 # macOS was GPL-3, and carrying one aggressive licence for one platform is risk bought for nothing.
 #
-# 🔴 AND IT REMOVES THE PATENT-ENCUMBERED DECODERS BY CONSTRUCTION. --disable-gpl drops x264 and x265, so
-# this build cannot encode H.264/H.265 at all. Decoding via the native decoders remains, which is what
-# video INGEST needs. That is a narrower patent surface than any prebuilt binary would have carried.
+# 🔴 IT NARROWS THE PATENT SURFACE TO DECODE ONLY — IT DOES NOT REMOVE IT, AND THE EARLIER WORDING HERE
+# SAID OTHERWISE. This comment read "removes the patent-encumbered DECODERS by construction" while its own
+# next sentence said decoding remains; the heading was simply wrong, and a legal review that stopped at it
+# would have drawn the opposite conclusion. Corrected 2026-08-30.
+#
+# What --disable-gpl actually drops is x264 and x265 — the ENCODERS — so this build cannot produce H.264 or
+# H.265 at all. It still ENABLES the native h264 and hevc DECODERS, because that is precisely what video
+# ingest is, and those are the codecs the pooled patents (Via LA, Access Advance) read on. Encode plus
+# decode is a wider exposure than decode alone, so this is a real narrowing; it is not an elimination.
+#
+# 🔴 CODEC PATENTS ARE A SEPARATE QUESTION FROM SOFTWARE LICENCE AND ARE NOT SETTLED BY ANY CHOICE HERE.
+# H.264/H.265 decode is encumbered whatever the licence of the decoder, so switching to a permissively
+# licensed one (openh264, BSD-2) changes the licence answer and not the patent answer — Cisco's own binary
+# is notable only because Cisco pays those royalties for it. Whether this product needs a pool licence is
+# a commercial decision for the owner, recorded here so it is a decision rather than an oversight.
 #
 # GitHub attaches a sha256 to every release asset, so the result flows through VAULT's ordinary verified
 # path — no "no digest" exception, exactly like llama.cpp and whisper.cpp.
