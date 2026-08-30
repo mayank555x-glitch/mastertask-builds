@@ -55,13 +55,13 @@ jobs:
           # — the resulting binary would carry instructions an ARM64 CPU cannot execute, and would fail at
           # load on the only machine it is for. Cross builds must always turn it off.
           #
-          # 🔴 CMAKE_SHARED_LIBRARY_PREFIX="" BECAUSE THE ARTIFACT MUST BE SHAPED LIKE UPSTREAM'S. mingw
-          # prefixes shared libraries with `lib`, MSVC does not — so the first build produced
-          # `libwhisper.dll` while upstream's whisper-bin-x64.zip carries `whisper.dll`. MasterTask's recipe
-          # names `entrypoint: whisper.dll` for every platform, so the ARM64 artifact would have installed,
-          # hashed and verified perfectly and then failed to load on the only machine it exists for.
-          # Setting the prefix at CONFIGURE time rather than renaming afterwards keeps every DLL's import
-          # table consistent with the filenames beside it.
+          # 🔴 THE `lib` PREFIX IS DEALT WITH IN `collect`, NOT HERE, AND THE FIRST ATTEMPT PROVES WHY.
+          # mingw prefixes shared libraries with `lib` and MSVC does not, so this build emits
+          # `libwhisper.dll` while upstream's whisper-bin-x64.zip carries `whisper.dll` — and MasterTask's
+          # recipe names `entrypoint: whisper.dll` for every platform. Passing
+          # `-DCMAKE_SHARED_LIBRARY_PREFIX=""` looked like the clean fix and CHANGED NOTHING (measured: the
+          # build still produced libwhisper.dll), because whisper.cpp sets the prefix per target — which is
+          # visible in the output itself, where `ggml.dll` has no prefix and `libwhisper.dll` does.
           cmake -S src -B build \
             -DCMAKE_SYSTEM_NAME=Windows \
             -DCMAKE_SYSTEM_PROCESSOR=ARM64 \
@@ -70,7 +70,6 @@ jobs:
             -DCMAKE_RC_COMPILER=aarch64-w64-mingw32-windres \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
-            -DCMAKE_SHARED_LIBRARY_PREFIX="" \
             -DGGML_NATIVE=OFF \
             -DWHISPER_BUILD_TESTS=OFF \
             -DWHISPER_BUILD_EXAMPLES=OFF
@@ -91,7 +90,29 @@ jobs:
           mkdir -p dist/Release
           find build -name '*.dll' -exec cp {} dist/Release/ \;
           ls -la dist/Release
-          test -f dist/Release/whisper.dll || { echo "whisper.dll was not produced — check CMAKE_SHARED_LIBRARY_PREFIX"; exit 1; }
+          # 🔴 RENAMED, THEN ITS IMPORTS ARE CHECKED — the rename is the easy half. Nothing imports
+          # whisper by name (MasterTask dlopens it by path), so renaming it is safe; but a rename that
+          # broke a dependency would produce a DLL that loads on nothing, and the error a customer sees is
+          # a missing library they have never heard of. So every DLL this one imports is resolved against
+          # what actually ships beside it.
+          mv dist/Release/libwhisper.dll dist/Release/whisper.dll
+          test -f dist/Release/whisper.dll || { echo "libwhisper.dll was not produced at all"; exit 1; }
+
+          echo "--- whisper.dll imports ---"
+          llvm-objdump -p dist/Release/whisper.dll | grep -i "DLL Name:" | sed 's/.*DLL Name: //' | tr -d '\r' | sort -u > /tmp/imports.txt
+          cat /tmp/imports.txt
+          missing=0
+          while read -r dep; do
+            [ -z "$dep" ] && continue
+            # A system DLL lives on the customer's Windows, not in our zip.
+            case "$(echo "$dep" | tr 'A-Z' 'a-z')" in
+              kernel32.dll|user32.dll|advapi32.dll|msvcrt.dll|ucrtbase.dll|api-ms-*|ws2_32.dll|ole32.dll|shell32.dll|bcrypt.dll|crypt32.dll|winmm.dll|powrprof.dll|dbghelp.dll|version.dll|iphlpapi.dll|secur32.dll|ntdll.dll) continue ;;
+            esac
+            if [ ! -f "dist/Release/$dep" ]; then
+              echo "MISSING DEPENDENCY: whisper.dll imports $dep, which is not in the artifact"; missing=1
+            fi
+          done < /tmp/imports.txt
+          [ "$missing" -eq 0 ] || { echo "the artifact would fail to load on a customer machine"; exit 1; }
           # 🔴 PROOF THE BYTES ARE REALLY ARM64. A cross build that silently fell back to the host compiler
           # produces a working x86_64 DLL that passes every other check here and fails on the only machine
           # it is for. `file` is the cheapest thing that can tell the difference.
