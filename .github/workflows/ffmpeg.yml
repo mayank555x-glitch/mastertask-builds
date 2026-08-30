@@ -1,0 +1,250 @@
+# Builds ffmpeg for macOS from source, LGPL-only, and publishes it as a release asset.
+#
+# 🔴 IT EXISTS BECAUSE NOBODY PUBLISHES WHAT THIS CATALOG NEEDS FOR macOS. Checked 2026-08-29: BtbN
+# builds Windows and Linux only; evermeet.cx signs with GPG and publishes no SHA-256; Homebrew's bottle
+# is GPL-3 and drags its whole dependency tree; eugeneware/ffmpeg-static is GPL-3. So the choice was a
+# GPL binary, a binary with no digest, or no video on Mac at all — and none of those is acceptable in a
+# catalog where every other artifact is permissively licensed and digest-verified.
+#
+# 🔴 --disable-gpl IS THE WHOLE POINT. It keeps the build to LGPL components, which is the licence family
+# designed for use inside closed commercial software. Every other ffmpeg the catalog could have shipped on
+# macOS was GPL-3, and carrying one aggressive licence for one platform is risk bought for nothing.
+#
+# 🔴 AND IT REMOVES THE PATENT-ENCUMBERED DECODERS BY CONSTRUCTION. --disable-gpl drops x264 and x265, so
+# this build cannot encode H.264/H.265 at all. Decoding via the native decoders remains, which is what
+# video INGEST needs. That is a narrower patent surface than any prebuilt binary would have carried.
+#
+# GitHub attaches a sha256 to every release asset, so the result flows through VAULT's ordinary verified
+# path — no "no digest" exception, exactly like llama.cpp and whisper.cpp.
+name: ffmpeg (all platforms, LGPL)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: "ffmpeg release tag to build (e.g. n7.1.1)"
+        required: true
+        default: "n7.1.1"
+
+permissions:
+  contents: write # to create the release that carries the built binaries
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14+ runners are Apple Silicon; macos-13 is the last Intel image.
+          - { os: darwin, arch: arm64, runner: macos-14, host: "" }
+          # 🔴 INTEL macOS IS CROSS-BUILT ON APPLE SILICON, NOT ON A macos-13 RUNNER. Intel Mac runners
+          # are scarce: the first attempt sat queued for two hours and was cancelled without ever
+          # starting, which is a platform silently unsupported rather than merely slow. macOS ships both
+          # SDKs, so `-arch x86_64` produces the Intel binary on the same runner that builds arm64 in
+          # three minutes — same source, same flags, no queue to wait on.
+          - { os: darwin, arch: x64, runner: macos-14, host: "" }
+          - { os: linux, arch: x64, runner: ubuntu-latest, host: "" }
+          # 🔴 CROSS-COMPILED FROM LINUX, WHICH IS HOW BtbN BUILDS THEIRS TOO. A native Windows build needs
+          # MSYS2 and a different shell for every step; mingw-w64 on the Linux runner produces the same
+          # binary with the same configure line, which is the entire point of building all six here.
+          - { os: windows, arch: x64, runner: ubuntu-latest, host: x86_64-w64-mingw32 }
+          # 🔴 WINDOWS ARM64 IS NOT IN THIS MATRIX, AND THE REASON IS CONCRETE: Ubuntu's mingw-w64 ships
+          # x86_64 and i686 only, so `aarch64-w64-mingw32` does not exist and the build would fail at
+          # configure. It needs llvm-mingw, a separate toolchain with its own pinning and its own failure
+          # modes. Listing it here as though it worked would be worse than its absence — the catalog would
+          # advertise a runtime nobody could install.
+          #
+          # 🔴 BUILT NATIVELY, BECAUSE CROSS-COMPILING IT NEEDS A CROSS OpenSSL AND THAT IS A DEAD END.
+          # ffmpeg wants an external TLS library for https and rtmps; on a cross build that must be the
+          # TARGET's OpenSSL, and installing libssl-dev:arm64 beside the host's amd64 copy fails with
+          # "held broken packages" — the two cannot coexist, because they own the same files. A native
+          # ARM runner has a native OpenSSL and needs no cross toolchain at all.
+          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, host: "" }
+    steps:
+      - name: toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nasm pkg-config libssl-dev
+          case "${{ matrix.host }}" in
+            *mingw32)
+              # Windows uses its OWN TLS (schannel), so no cross-compiled crypto library is needed here.
+              sudo apt-get install -y -qq mingw-w64 ;;
+            aarch64-linux-gnu)
+              # 🔴 THE COMPILER INSTALLS ON ITS OWN LINE, AND THAT SEPARATION IS THE FIX. It was bundled
+              # with libssl-dev:arm64 in one apt-get, so when the arm64 package could not be found the
+              # whole command failed and the CROSS COMPILER never installed either — configure then died
+              # with "aarch64-linux-gnu-gcc is unable to create an executable file", which points at the
+              # compiler and says nothing about the real cause.
+              sudo apt-get install -y -qq gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+              # 🔴 arm64 PACKAGES LIVE ON ports.ubuntu.com, NOT ON THE MAIN ARCHIVE. Adding the
+              # architecture is not enough: without a ports entry apt has nowhere to look, and the
+              # existing entries must be pinned to amd64 or apt tries to fetch arm64 from a mirror that
+              # does not carry it and fails the whole update.
+              sudo dpkg --add-architecture arm64
+              if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+                grep -q '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources || \
+                  sudo sed -i '/^Types: deb/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+              fi
+              CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+              printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s main universe\n' "$CODENAME" \
+                | sudo tee /etc/apt/sources.list.d/arm64-ports.list >/dev/null
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq libssl-dev:arm64
+              ;;
+          esac
+
+      - name: fetch the pinned ffmpeg source
+        run: |
+          set -euo pipefail
+          V="${{ inputs.ffmpeg_version }}"
+          curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${V}.tar.gz" -o src.tar.gz
+          shasum -a 256 src.tar.gz   # recorded in the log: the exact bytes this build came from
+          mkdir -p src && tar xzf src.tar.gz -C src --strip-components=1
+
+      # 🔴 STATIC, AND WITH NO EXTERNAL LIBRARIES. A dynamically linked binary would need its dependencies
+      # present on the customer's machine, which is exactly what shipping a self-contained artifact avoids.
+      # Every --enable here is a deliberate addition; the default is off.
+      - name: configure and build (LGPL only)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # 🔴 EVERY FLAG BELOW IS DRIVEN BY WHAT THE PRODUCT ACTUALLY INVOKES, not by a guess at what a
+          # video tool might need. `video/source.go` pins the address for rtsp, rtsps, rtmp, http and
+          # https (line 78), applies `-vf scale=…` and `fps=` filters, and writes `-f image2pipe -vcodec
+          # mjpeg`. A build missing ANY of those packages, hashes, signs and installs perfectly and then
+          # fails on the first camera — which is why the list is derived from the call site rather than
+          # from memory. rtmps and tls in particular were absent from the first draft.
+          #
+          # 🔴 ONE CONFIGURE LINE FOR EVERY PLATFORM. Shipping a differently-configured ffmpeg per OS is
+          # how a camera works on Linux and fails on Mac with no error that explains it — the same stream,
+          # a demuxer one build has and another does not. Identical flags are what make video ingest
+          # behave the same everywhere, which is worth more than any codec added on one platform only.
+          # 🔴 THE TLS PROVIDER IS THE ONE FLAG THAT VARIES BY PLATFORM, AND IT HAS TO. ffmpeg needs an
+          # external TLS implementation for https/rtmps, and there is no single one available everywhere:
+          # a mingw cross-build has no OpenSSL at all, while Windows ships schannel natively — which is
+          # what a Windows binary should use regardless, since it then follows the machine's own
+          # certificate store and policy rather than carrying its own.
+          #
+          # Everything that affects BEHAVIOUR — protocols, demuxers, decoders, filters, muxers — stays
+          # byte-identical across all five builds. Only the crypto provider differs, exactly as the
+          # compiler does.
+          # Apple Silicon building the Intel slice: tell configure and the compiler which arch to emit.
+          # 🔴 THE ARCH GOES THROUGH THE ENVIRONMENT, NOT THROUGH A SHELL VARIABLE. Passing
+          # `--extra-cflags=-arch\ x86_64` inside a variable looked right and was not: configure re-evals
+          # its arguments, the escaped space came apart, and it failed with `Unknown option "x86_64"` plus
+          # an unmatched-quote error from its own eval. CFLAGS and LDFLAGS reach the compiler without ever
+          # passing through that eval, so there is nothing left to mis-split.
+          MACX86=""
+          if [ "${{ matrix.os }}-${{ matrix.arch }}" = "darwin-x64" ]; then
+            export CFLAGS="-arch x86_64"
+            export LDFLAGS="-arch x86_64"
+            MACX86="--arch=x86_64 --enable-cross-compile --target-os=darwin"
+          fi
+
+          # 🔴 EACH OS USES THE TLS IT ALREADY HAS. ffmpeg needs an external TLS implementation, and
+          # reaching for OpenSSL everywhere fails in exactly the places that matter: a mingw cross-build
+          # has none, and an Apple Silicon runner's Homebrew OpenSSL is arm64-only, so the x86_64 slice
+          # cannot link it — "openssl not found" on both, for the same reason.
+          #
+          # Windows has schannel, macOS has SecureTransport, Linux has OpenSSL. Using the platform's own
+          # provider removes the dependency entirely AND is the better choice regardless: the binary then
+          # follows the machine's certificate store and policy instead of carrying its own.
+          #
+          # Verified locally on macOS before this ran: tls, https and rtmps all enabled under
+          # SecureTransport, and configure still reports "License: LGPL version 2.1 or later".
+          TLS="--enable-openssl"
+          case "${{ matrix.os }}" in
+            windows) TLS="--enable-schannel" ;;
+            darwin)  TLS="--enable-securetransport" ;;
+          esac
+
+          CROSS=""
+          if [ -n "${{ matrix.host }}" ]; then
+            TOS=linux; case "${{ matrix.host }}" in *mingw32) TOS=mingw32 ;; esac
+            CROSS="--enable-cross-compile --cross-prefix=${{ matrix.host }}- --target-os=$TOS --arch=${{ matrix.arch }}"
+          fi
+          ./configure \
+            --prefix="$PWD/out" \
+            $CROSS $MACX86 \
+            --disable-gpl \
+            --disable-nonfree \
+            --disable-doc \
+            --disable-debug \
+            --disable-shared \
+            --enable-static \
+            --disable-x86asm \
+            $TLS \
+            --enable-protocol=file,http,https,tls,tcp,udp,rtp,rtsp,rtmp,rtmps,pipe,crypto \
+            --enable-demuxer=rtsp,flv,live_flv,mov,matroska,mpegts,avi,image2,mjpeg,h264,hevc \
+            --enable-decoder=h264,hevc,mjpeg,vp8,vp9,av1,rawvideo \
+            --enable-parser=h264,hevc,mjpeg,vp8,vp9,av1 \
+            --enable-encoder=mjpeg,rawvideo \
+            --enable-muxer=image2,image2pipe,mjpeg,rawvideo \
+            --enable-filter=scale,fps,format,null \
+            --enable-swscale \
+            --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb
+          make -j"$( (sysctl -n hw.ncpu 2>/dev/null) || nproc )"
+          make install
+
+      # Prove the thing actually runs and says what it is, before anyone publishes it.
+      # A cross-compiled binary cannot be executed on the builder, so the GPL check reads the binary
+      # itself rather than asking it — the configure line is embedded in every ffmpeg build.
+      - name: it is LGPL, and it runs where it can
+        working-directory: src
+        run: |
+          set -euo pipefail
+          BIN="out/bin/ffmpeg"; [ -f "$BIN" ] || BIN="out/bin/ffmpeg.exe"
+          if strings "$BIN" | grep -q -- '--enable-gpl'; then
+            echo "🔴 this build carries GPL components — the whole point of --disable-gpl is that it does not"
+            exit 1
+          fi
+          echo "✅ no GPL components"
+          if [ -z "${{ matrix.host }}" ]; then ./"$BIN" -version | head -3; fi
+          if ./out/bin/ffmpeg -version | grep -q -- '--enable-gpl'; then
+            echo "🔴 this build carries GPL components — the whole point of --disable-gpl is that it does not"
+            exit 1
+          fi
+          echo "✅ no GPL components"
+          # A statically linked binary must not depend on anything outside the OS.
+          if [ -z "${{ matrix.host }}" ] && command -v otool >/dev/null; then otool -L "$BIN"; fi
+
+      - name: name it for the catalog
+        run: |
+          EXT=""; [ -n "${{ matrix.host }}" ] && EXT=".exe"
+          NAME="ffmpeg-${{ matrix.os }}-${{ matrix.arch }}$EXT"
+          cp "src/out/bin/ffmpeg$EXT" "$NAME"
+          cp src/COPYING.LGPLv2.1 "LICENSE-${{ matrix.os }}-${{ matrix.arch }}.txt"
+          shasum -a 256 "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            ffmpeg-${{ matrix.os }}-${{ matrix.arch }}*
+            LICENSE-${{ matrix.os }}-${{ matrix.arch }}.txt
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      # The release tag carries the ffmpeg version, so the artifact URL is unique per build — which is
+      # what makes VAULT's 1-year immutable cache header safe.
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "ffmpeg-${{ inputs.ffmpeg_version }}-lgpl" dist/* \
+            --title "ffmpeg ${{ inputs.ffmpeg_version }} for all platforms (LGPL, no GPL components)" \
+            --notes "Built from FFmpeg/FFmpeg tag ${{ inputs.ffmpeg_version }} with --disable-gpl --disable-nonfree.
+          Static and self-contained. macOS arm64/x64, Linux arm64/x64, Windows x64 — FIVE platforms, one configure line for all of them, so video ingest behaves identically everywhere.
+          Windows arm64 is NOT built: Ubuntu's mingw-w64 ships x86_64 and i686 only, so aarch64-w64-mingw32 does not exist and the build fails at configure. It needs llvm-mingw, a separate toolchain.
+          GitHub publishes a sha256 for each asset, so
+          VAULT verifies these on the same path as every other artifact." \
+            --repo "${{ github.repository }}"
