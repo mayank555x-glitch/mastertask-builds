@@ -52,7 +52,14 @@ jobs:
           cuda: ${{ inputs.cuda_version }}
           method: network
           # Only what a build needs. The full toolkit is ~4 GB and most of it is profilers and samples.
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas-dev", "nvtx"]'
+          #
+          # 🔴 cuBLAS IS NOT A `cuda-` PACKAGE, AND PUTTING IT HERE FAILS THE INSTALL. Everything in
+          # `sub-packages` is prefixed `cuda-`, giving `cuda-cublas-12-4` — which does not exist on
+          # NVIDIA's apt repo. Measured: `E: Unable to locate package cuda-cublas-12-4`. The real names are
+          # `libcublas-12-4` / `libcublas-dev-12-4`, and `non-cuda-sub-packages` is the input for exactly
+          # that difference.
+          sub-packages: '["nvcc", "cudart", "nvtx"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
 
       - name: fetch the pinned source
         run: |
