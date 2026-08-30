@@ -27,7 +27,7 @@ native decoders remains, which is what video *ingest* needs.
 | macOS arm64 · x64 | ✅ | x64 is cross-built on Apple Silicon — Intel runners queue for hours |
 | Linux x64 · arm64 | ✅ | |
 | Windows x64 | ✅ | cross-compiled from Linux with mingw-w64, as BtbN does |
-| **Windows arm64** | ❌ | Ubuntu's mingw-w64 ships x86_64 and i686 only, so `aarch64-w64-mingw32` does not exist and the build fails at configure. It needs llvm-mingw — a separate toolchain with its own pinning |
+| Windows arm64 | ✅ | cross-compiled with **llvm-mingw** (pinned `20260826`), which carries the `aarch64-w64-mingw32` target Ubuntu's mingw-w64 does not. Feasible only because Windows brings its own TLS (schannel) — every other cross target would need a crypto library built for the target |
 
 ## How a build is run
 

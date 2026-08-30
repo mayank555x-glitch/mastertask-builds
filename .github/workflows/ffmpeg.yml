@@ -50,11 +50,15 @@ jobs:
           # MSYS2 and a different shell for every step; mingw-w64 on the Linux runner produces the same
           # binary with the same configure line, which is the entire point of building all six here.
           - { os: windows, arch: x64, runner: ubuntu-latest, host: x86_64-w64-mingw32 }
-          # 🔴 WINDOWS ARM64 IS NOT IN THIS MATRIX, AND THE REASON IS CONCRETE: Ubuntu's mingw-w64 ships
-          # x86_64 and i686 only, so `aarch64-w64-mingw32` does not exist and the build would fail at
-          # configure. It needs llvm-mingw, a separate toolchain with its own pinning and its own failure
-          # modes. Listing it here as though it worked would be worse than its absence — the catalog would
-          # advertise a runtime nobody could install.
+          # 🔴 WINDOWS ARM64 USES llvm-mingw, NOT UBUNTU'S mingw-w64, AND THAT IS THE WHOLE DIFFICULTY.
+          # Ubuntu's mingw-w64 ships x86_64 and i686 targets only — `aarch64-w64-mingw32` does not exist in
+          # it, and configure dies before compiling anything. llvm-mingw is a separate toolchain that DOES
+          # carry that target; it is downloaded and pinned in the toolchain step below.
+          #
+          # 🔴 IT IS FEASIBLE ONLY BECAUSE WINDOWS BRINGS ITS OWN TLS. Every other cross target needs an
+          # external crypto library built for the TARGET, which is the dead end that keeps linux-arm64 on a
+          # native runner. Windows uses schannel, so this build needs no cross OpenSSL at all.
+          - { os: windows, arch: arm64, runner: ubuntu-latest, host: aarch64-w64-mingw32 }
           #
           # 🔴 BUILT NATIVELY, BECAUSE CROSS-COMPILING IT NEEDS A CROSS OpenSSL AND THAT IS A DEAD END.
           # ffmpeg wants an external TLS library for https and rtmps; on a cross build that must be the
@@ -69,6 +73,17 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq nasm pkg-config libssl-dev
           case "${{ matrix.host }}" in
+            aarch64-w64-mingw32)
+              # 🔴 PINNED, AND VERIFIED BEFORE IT IS TRUSTED. A toolchain fetched from a release is the
+              # compiler for a binary customers install, so its digest is checked exactly like ffmpeg's own
+              # source — the same rule that governs every artifact in this catalog.
+              LLVM_MINGW=llvm-mingw-20260826-ucrt-ubuntu-22.04-x86_64
+              curl -fsSL --retry 3 -o llvm-mingw.tar.xz \
+                "https://github.com/mstorsjo/llvm-mingw/releases/download/20260826/${LLVM_MINGW}.tar.xz"
+              shasum -a 256 llvm-mingw.tar.xz   # recorded in the log: the exact toolchain this build used
+              sudo tar xJf llvm-mingw.tar.xz -C /opt
+              echo "/opt/${LLVM_MINGW}/bin" >> "$GITHUB_PATH"
+              ;;
             *mingw32)
               # Windows uses its OWN TLS (schannel), so no cross-compiled crypto library is needed here.
               sudo apt-get install -y -qq mingw-w64 ;;
@@ -243,8 +258,8 @@ jobs:
           gh release create "ffmpeg-${{ inputs.ffmpeg_version }}-lgpl" dist/* \
             --title "ffmpeg ${{ inputs.ffmpeg_version }} for all platforms (LGPL, no GPL components)" \
             --notes "Built from FFmpeg/FFmpeg tag ${{ inputs.ffmpeg_version }} with --disable-gpl --disable-nonfree.
-          Static and self-contained. macOS arm64/x64, Linux arm64/x64, Windows x64 — FIVE platforms, one configure line for all of them, so video ingest behaves identically everywhere.
-          Windows arm64 is NOT built: Ubuntu's mingw-w64 ships x86_64 and i686 only, so aarch64-w64-mingw32 does not exist and the build fails at configure. It needs llvm-mingw, a separate toolchain.
+          Static and self-contained. macOS arm64/x64, Linux arm64/x64, Windows arm64/x64 — SIX platforms, one configure line for all of them, so video ingest behaves identically everywhere.
+          Windows arm64 is cross-compiled with llvm-mingw (pinned), which carries the aarch64-w64-mingw32 target Ubuntu mingw-w64 lacks.
           GitHub publishes a sha256 for each asset, so
           VAULT verifies these on the same path as every other artifact." \
             --repo "${{ github.repository }}"
