@@ -40,8 +40,8 @@ jobs:
       fail-fast: false # one engine failing must not hide the state of the other
       matrix:
         include:
-          - { engine: llama, repo: ggml-org/llama.cpp, entry: libllama.so }
-          - { engine: whisper, repo: ggml-org/whisper.cpp, entry: libwhisper.so }
+          - { engine: llama, repo: ggml-org/llama.cpp, entry: libllama.so, target: llama }
+          - { engine: whisper, repo: ggml-org/whisper.cpp, entry: libwhisper.so, target: whisper }
     steps:
       # 🔴 ubuntu-22.04, NOT ubuntu-latest. CUDA 12.4's host compiler support tops out below the GCC that
       # ships on 24.04, and nvcc rejects it outright — "unsupported GNU version". Pinning the runner is
@@ -85,7 +85,12 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
             -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF
-          cmake --build build --config Release -j"$(nproc)"
+          # 🔴 THE LIBRARY TARGET ONLY, NOT `all`. MasterTask dlopens libllama.so / libwhisper.so; it never
+          # runs their CLI tools. Building everything cost 48 minutes of correct CUDA compilation and then
+          # failed at the final link — `cannot find -lllama-server-impl` — because turning the server and
+          # examples off left llama.cpp's `llama-app` target still trying to link them. Naming the target
+          # removes a whole class of failure that has nothing to do with what we ship, and is faster.
+          cmake --build build --config Release -j"$(nproc)" --target ${{ matrix.target }}
 
       - name: collect and PROVE it is a CUDA build
         run: |
