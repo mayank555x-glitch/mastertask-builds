@@ -1,0 +1,97 @@
+# Builds whisper.cpp for Windows ARM64 from source, and publishes it as a release asset.
+#
+# 🔴 IT EXISTS BECAUSE UPSTREAM PUBLISHES EVERY OTHER PLATFORM AND NOT THIS ONE. Checked 2026-08-30 against
+# ggml-org/whisper.cpp v1.9.1: the release carries `whisper-bin-x64.zip`, `whisper-bin-Win32.zip`,
+# `whisper-bin-ubuntu-arm64.tar.gz` and an xcframework — and no windows-arm64 anything. MasterTask already
+# ships llama-cpu, onnx-cpu and ffmpeg for Windows ARM64, so transcription was the single dead capability on
+# a platform where everything else worked.
+#
+# 🔴 CROSS-COMPILED WITH llvm-mingw, FOR THE SAME REASON AS ffmpeg. Ubuntu's mingw-w64 has x86_64 and i686
+# targets only; `aarch64-w64-mingw32` exists only in llvm-mingw. The toolchain is pinned and its digest is
+# logged, because it compiles a binary customers install.
+#
+# 🔴 THE ARTIFACT IS `whisper.dll`, NOT AN EXECUTABLE. MasterTask dlopens the library from its runner
+# subprocess; a CLI binary would be useless to it. `-DBUILD_SHARED_LIBS=ON` is therefore not a preference.
+name: whisper.cpp (Windows ARM64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_version:
+        description: "whisper.cpp release tag to build (e.g. v1.9.1)"
+        required: true
+        default: "v1.9.1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: windows-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - name: llvm-mingw toolchain (pinned)
+        run: |
+          set -euo pipefail
+          LLVM_MINGW=llvm-mingw-20260826-ucrt-ubuntu-22.04-x86_64
+          curl -fsSL --retry 3 -o llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20260826/${LLVM_MINGW}.tar.xz"
+          shasum -a 256 llvm-mingw.tar.xz   # recorded in the log: the exact toolchain this build used
+          sudo tar xJf llvm-mingw.tar.xz -C /opt
+          echo "/opt/${LLVM_MINGW}/bin" >> "$GITHUB_PATH"
+
+      - name: fetch the pinned whisper.cpp source
+        run: |
+          set -euo pipefail
+          V="${{ inputs.whisper_version }}"
+          curl -fsSL "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/${V}.tar.gz" -o src.tar.gz
+          shasum -a 256 src.tar.gz   # recorded in the log: the exact bytes this build came from
+          mkdir -p src && tar xzf src.tar.gz -C src --strip-components=1
+
+      - name: configure and build
+        run: |
+          set -euo pipefail
+          # 🔴 NO -DGGML_NATIVE. It compiles for the MACHINE DOING THE BUILD, which here is an x86_64 runner
+          # — the resulting binary would carry instructions an ARM64 CPU cannot execute, and would fail at
+          # load on the only machine it is for. Cross builds must always turn it off.
+          cmake -S src -B build \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_SYSTEM_PROCESSOR=ARM64 \
+            -DCMAKE_C_COMPILER=aarch64-w64-mingw32-clang \
+            -DCMAKE_CXX_COMPILER=aarch64-w64-mingw32-clang++ \
+            -DCMAKE_RC_COMPILER=aarch64-w64-mingw32-windres \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j"$(nproc)"
+
+      - name: collect
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # 🔴 EVERY .dll THE BUILD PRODUCED, NOT JUST whisper.dll. ggml is split into its own libraries
+          # (ggml.dll, ggml-base.dll, ggml-cpu.dll); shipping whisper.dll alone produces an artifact that
+          # loads on the build machine — where the others sit beside it — and fails on a customer's with a
+          # missing-dependency error naming a library they have never heard of.
+          find build -name '*.dll' -exec cp {} dist/ \;
+          ls -la dist
+          test -f dist/whisper.dll || { echo "whisper.dll was not produced"; exit 1; }
+          # A quick proof the bytes really are ARM64 and not a silently-native x86 build.
+          file dist/whisper.dll
+          file dist/whisper.dll | grep -qi "aarch64\|ARM64" || { echo "whisper.dll is NOT an ARM64 binary"; exit 1; }
+          cp src/LICENSE dist/LICENSE.txt
+          cd dist && zip -r ../whisper-bin-arm64.zip . && cd ..
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "whisper-${{ inputs.whisper_version }}-winarm64" whisper-bin-arm64.zip \
+            --title "whisper.cpp ${{ inputs.whisper_version }} for Windows ARM64" \
+            --notes "Cross-compiled from ggml-org/whisper.cpp tag ${{ inputs.whisper_version }} with llvm-mingw (pinned 20260826), which carries the aarch64-w64-mingw32 target Ubuntu's mingw-w64 does not.
+          Upstream publishes x64, Win32, ubuntu-arm64 and an xcframework — but no Windows ARM64 binary, which left transcription as the one dead capability on a platform where chat, vision and video all worked.
+          Shared libraries (whisper.dll plus the ggml libraries it depends on); GitHub publishes a sha256 for the asset, so MasterTask verifies it on the same path as every other artifact." \
+            --repo "${{ github.repository }}"

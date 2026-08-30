@@ -1,9 +1,17 @@
-# MasterTask — ffmpeg builds
+# MasterTask — builds
 
-LGPL-only ffmpeg binaries used by MasterTask, built from FFmpeg's own source by the workflow in this
-repository, and published as release assets.
+Binaries MasterTask needs that nobody publishes in the shape it requires. Each is built from its upstream's
+own source by a workflow in this repository and published as a release asset, so MasterTask verifies them on
+exactly the same digest-checked path as every other artifact in its catalog.
 
-## Why this repository is public
+| Workflow | Why it exists here |
+|---|---|
+| [`ffmpeg.yml`](.github/workflows/ffmpeg.yml) | Nobody publishes an **LGPL** ffmpeg for macOS, and no one publishes any ffmpeg for **Windows ARM64** |
+| [`whisper.yml`](.github/workflows/whisper.yml) | whisper.cpp publishes no **Windows ARM64** binary |
+
+## ffmpeg
+
+### Why this repository is public
 
 **Two reasons, and neither is that anyone is expected to browse it.**
 
@@ -15,7 +23,7 @@ repository, and published as release assets.
    upstream — llama.cpp, whisper.cpp, Hugging Face, Chrome for Testing. ffmpeg was the single exception, and
    that one exception is why a GitHub token had to exist at all. A token expires; a public release does not.
 
-## What is built
+### What is built
 
 `--disable-gpl --disable-nonfree`, static, self-contained. That keeps the build to the LGPL component set —
 the licence family written for use inside closed commercial software — and, by construction, drops the
@@ -29,7 +37,7 @@ native decoders remains, which is what video *ingest* needs.
 | Windows x64 | ✅ | cross-compiled from Linux with mingw-w64, as BtbN does |
 | Windows arm64 | ✅ | cross-compiled with **llvm-mingw** (pinned `20260826`), which carries the `aarch64-w64-mingw32` target Ubuntu's mingw-w64 does not. Feasible only because Windows brings its own TLS (schannel) — every other cross target would need a crypto library built for the target |
 
-## How a build is run
+### How a build is run
 
 Actions → **ffmpeg (all platforms, LGPL)** → Run workflow → enter the FFmpeg tag (e.g. `n7.1.1`).
 It creates a release tagged `ffmpeg-<version>-lgpl` carrying one asset per platform. GitHub publishes a
