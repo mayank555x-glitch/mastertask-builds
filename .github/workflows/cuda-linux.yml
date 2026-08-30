@@ -1,0 +1,134 @@
+# Builds llama.cpp and whisper.cpp for LINUX + NVIDIA from source, and publishes them as release assets.
+#
+# 🔴 IT EXISTS BECAUSE NEITHER UPSTREAM PUBLISHES A LINUX CUDA BUILD, AND LINUX+NVIDIA IS THE STANDARD
+# ENTERPRISE GPU HOST. Checked 2026-08-30 against the exact pinned tags:
+#   llama.cpp b9964  → win-cuda-12.4, ubuntu-rocm, ubuntu-sycl, ubuntu-vulkan, ubuntu-arm64 … no ubuntu-cuda
+#   whisper.cpp v1.9.1 → whisper-cublas-12.4.0-bin-x64 (Windows only); ubuntu assets are CPU
+# So on a Linux machine with an NVIDIA card, MasterTask ran chat and transcription on the CPU while
+# onnx-cuda12-linux-x64 used the GPU beside it — a silent, per-engine performance cliff.
+#
+# 🔴 THE RUNNER HAS NO GPU, AND THAT LIMIT IS STATED RATHER THAN PAPERED OVER. This proves the artifacts
+# BUILD and LINK against CUDA and that the CUDA symbols are really present; it cannot prove inference. The
+# `ldd`/`nm` checks below are what stands in for that, and they are the difference between "it compiled"
+# and "it is a CUDA build" — a CPU-only fallback compiles perfectly and would ship as `cuda12`.
+name: llama.cpp + whisper.cpp (Linux CUDA)
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_version:
+        description: "llama.cpp tag (e.g. b9964)"
+        required: true
+        default: "b9964"
+      whisper_version:
+        description: "whisper.cpp tag (e.g. v1.9.1)"
+        required: true
+        default: "v1.9.1"
+      cuda_version:
+        description: "CUDA toolkit version"
+        required: true
+        default: "12.4.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.engine }}-cuda-linux-x64
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false # one engine failing must not hide the state of the other
+      matrix:
+        include:
+          - { engine: llama, repo: ggml-org/llama.cpp, entry: libllama.so }
+          - { engine: whisper, repo: ggml-org/whisper.cpp, entry: libwhisper.so }
+    steps:
+      # 🔴 ubuntu-22.04, NOT ubuntu-latest. CUDA 12.4's host compiler support tops out below the GCC that
+      # ships on 24.04, and nvcc rejects it outright — "unsupported GNU version". Pinning the runner is
+      # cheaper than pinning a compiler inside it.
+      - name: CUDA toolkit ${{ inputs.cuda_version }}
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: ${{ inputs.cuda_version }}
+          method: network
+          # Only what a build needs. The full toolkit is ~4 GB and most of it is profilers and samples.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas-dev", "nvtx"]'
+
+      - name: fetch the pinned source
+        run: |
+          set -euo pipefail
+          V="${{ matrix.engine == 'llama' && inputs.llama_version || inputs.whisper_version }}"
+          curl -fsSL "https://github.com/${{ matrix.repo }}/archive/refs/tags/${V}.tar.gz" -o src.tar.gz
+          shasum -a 256 src.tar.gz   # recorded in the log: the exact bytes this build came from
+          mkdir -p src && tar xzf src.tar.gz -C src --strip-components=1
+
+      - name: configure and build
+        run: |
+          set -euo pipefail
+          # 🔴 GGML_NATIVE=OFF. It compiles for the runner's own CPU, which is not the customer's — a
+          # -march=native build crashes with SIGILL on any older machine, and only on some of them.
+          # 🔴 CMAKE_CUDA_ARCHITECTURES pins the GPU generations this supports. "all-major" covers Maxwell
+          # through Hopper in one binary; leaving it unset builds for the BUILDER's card, and the runner
+          # has none, so the default is whatever nvcc guesses.
+          cmake -S src -B build \
+            -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES=all-major \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j"$(nproc)"
+
+      - name: collect and PROVE it is a CUDA build
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find build -name '*.so' -exec cp {} dist/ \;
+          ls -la dist
+          test -f "dist/${{ matrix.entry }}" || { echo "${{ matrix.entry }} was not produced"; exit 1; }
+
+          # 🔴 A CPU-ONLY FALLBACK COMPILES PERFECTLY AND WOULD SHIP AS `cuda12`. If GGML_CUDA silently did
+          # not take, everything above still succeeds and the artifact installs on a GPU machine and quietly
+          # runs on the CPU — the exact failure this whole workflow exists to remove. So the CUDA runtime
+          # must be a real, named dependency of the bytes.
+          echo "--- linked libraries ---"
+          ldd dist/*.so | sort -u | grep -iE "cuda|cublas" || {
+            echo "NO CUDA LIBRARY IS LINKED — this is a CPU build wearing a cuda12 label"; exit 1; }
+
+          echo "--- CUDA symbols present? ---"
+          nm -D --defined-only dist/*.so 2>/dev/null | grep -qi "ggml_backend_cuda" || {
+            echo "the CUDA backend symbols are absent — GGML_CUDA did not take"; exit 1; }
+
+          # The CUDA runtime libraries themselves, so the artifact is self-contained exactly like the
+          # Windows one (which merges cudart alongside the engine).
+          for lib in libcudart libcublas libcublasLt; do
+            find "${CUDA_PATH:-/usr/local/cuda}" -name "${lib}.so.*" -exec cp -n {} dist/ \; 2>/dev/null || true
+          done
+          ls -la dist
+          cp src/LICENSE dist/LICENSE.txt 2>/dev/null || cp src/LICENSE.txt dist/ 2>/dev/null || true
+          tar czf ${{ matrix.engine }}-cuda12-linux-x64.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.engine }}-cuda-linux
+          path: ${{ matrix.engine }}-cuda12-linux-x64.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          gh release create "cuda-linux-llama-${{ inputs.llama_version }}-whisper-${{ inputs.whisper_version }}" dist/* \
+            --title "llama.cpp ${{ inputs.llama_version }} + whisper.cpp ${{ inputs.whisper_version }} — Linux CUDA ${{ inputs.cuda_version }}" \
+            --notes "Neither upstream publishes a Linux CUDA build. llama.cpp ships win-cuda, ubuntu-rocm, ubuntu-sycl, ubuntu-vulkan and ubuntu-arm64; whisper.cpp's ubuntu assets are CPU only. On a Linux host with an NVIDIA card that left chat and transcription on the CPU while ONNX used the GPU beside them.
+          Built from each upstream's pinned tag with -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=all-major, and verified to LINK against CUDA and to export the ggml_backend_cuda symbols — a CPU-only fallback compiles perfectly and would otherwise ship wearing a cuda12 label. The CUDA runtime libraries are bundled so the artifact is self-contained, as the Windows build is.
+          The runner has no GPU, so this proves the build and the linkage, not inference." \
+            --repo "${{ github.repository }}"
