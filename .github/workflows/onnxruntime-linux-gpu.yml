@@ -94,6 +94,8 @@ jobs:
           set -euo pipefail
           curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
+          # AMD's graphics libraries (rccl needs libdrm-amdgpu-amdgpu1 and libdrm2-amdgpu), from AMD's own install steps.
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/$ROCM_VERSION/ubuntu jammy main" | sudo tee /etc/apt/sources.list.d/amdgpu.list
           printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update -y
           # rocm-libs as ONNX Runtime's own CI image installs it: MIGraphX's CMake config needs MIOpen's (measured).
