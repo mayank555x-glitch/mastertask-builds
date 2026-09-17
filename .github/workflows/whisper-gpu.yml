@@ -172,7 +172,21 @@ jobs:
         run: |
           set -euo pipefail
           ls -la dist
-          gh release create "whisper-${{ inputs.whisper_version }}-gpu" dist/* \
+          # One asset at a time, with retries, never replacing one already published (see cuda-linux.yml).
+          TAG="whisper-${{ inputs.whisper_version }}-gpu"
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || gh release create "$TAG" --draft \
             --title "whisper.cpp ${{ inputs.whisper_version }} — Vulkan (Linux, Windows) and CUDA ${{ inputs.cuda_version }} (Windows)" \
             --notes "Built from whisper.cpp's pinned tag. Vulkan: -DGGML_VULKAN=ON, verified to link the Vulkan loader. CUDA 13: -DGGML_CUDA=ON with the CUDA runtime bundled, verified to import cuBLAS 13. GGML_NATIVE=OFF throughout. The runners have no GPU, so this proves the build and its linkage, not inference." \
             --repo "${{ github.repository }}"
+          have=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name')
+          for f in dist/*; do
+            name=$(basename "$f")
+            if printf '%s\n' "$have" | grep -qx "$name"; then echo "$name is already published under $TAG — kept as it is"; continue; fi
+            for try in 1 2 3 4 5; do
+              gh release upload "$TAG" "$f" --repo "${{ github.repository }}" && break
+              echo "upload of $name failed (attempt $try)"
+              [ "$try" = 5 ] && exit 1
+              sleep $((try * 30))
+            done
+          done
+          gh release edit "$TAG" --draft=false --repo "${{ github.repository }}"
