@@ -1,0 +1,140 @@
+# Builds ONNX Runtime for Linux with the OpenVINO provider (Intel GPUs and NPUs) and the MIGraphX provider (AMD GPUs)
+# from ONNX Runtime's pinned source, and publishes them as release assets (MasterTask H32 decision 2). ONNX Runtime
+# publishes these two only as Python wheels, which MasterTask cannot load.
+#
+# 🔴 THE VERSIONS ARE ONNX RUNTIME'S OWN: OpenVINO 2025.2.0 and ROCm 6.4 are what v1.23.0's CI builds these providers
+# against (`tools/ci_build/github/linux/docker/inference/x86_64/python/openvino/Dockerfile`,
+# `migraphx-ci-pipeline-env.Dockerfile` at the tag), read 2026-09-17 — never "latest", which ONNX Runtime has not tested.
+#
+# 🔴 OPENVINO SHIPS INSIDE; ROCm DOES NOT. Intel's OpenVINO runtime is a set of libraries the OpenVINO build needs beside it
+# and is redistributable with its terms carried (MasterTask §16.2). ROCm is AMD's GPU software stack — like a CUDA driver it
+# belongs to the machine (several gigabytes, installed by the operator) — so the MIGraphX build names its requirement and
+# fails its load test with a named cause where ROCm is absent, and MasterTask falls back to the next build (decision 21).
+#
+# 🔴 EACH BUILD IS PROVEN TO CARRY ITS PROVIDER, NOT MERELY TO COMPILE: a provider library that is absent or cannot resolve
+# its dependencies inside the archive fails the run.
+name: ONNX Runtime Linux GPU (OpenVINO, MIGraphX) from source
+
+on:
+  workflow_dispatch:
+    inputs:
+      ort_version:
+        description: "ONNX Runtime tag"
+        required: true
+        default: "v1.23.0"
+
+permissions:
+  contents: write
+
+env:
+  OPENVINO_URL: https://storage.openvinotoolkit.org/repositories/openvino/packages/2025.2/linux/openvino_toolkit_ubuntu22_2025.2.0.19140.c01cd93e24d_x86_64.tgz
+  ROCM_VERSION: "6.4"
+
+jobs:
+  openvino:
+    name: onnxruntime-openvino-linux-x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    steps:
+      - name: free disk (an ONNX Runtime build needs ~25 GB)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: OpenVINO runtime, verified against Intel's published SHA-256
+        run: |
+          set -euo pipefail
+          curl -fsSL -o ov.tgz "$OPENVINO_URL"
+          want=$(curl -fsSL "$OPENVINO_URL.sha256" | awk '{print $1}')
+          got=$(sha256sum ov.tgz | awk '{print $1}')
+          [ "$got" = "$want" ] || { echo "🔴 the OpenVINO archive does not match Intel's SHA-256"; exit 1; }
+          sudo mkdir -p /opt/intel && sudo tar xzf ov.tgz -C /opt/intel && sudo mv /opt/intel/openvino_toolkit_* /opt/intel/openvino
+          sudo /opt/intel/openvino/install_dependencies/install_openvino_dependencies.sh -y || true
+      - name: fetch the pinned ONNX Runtime source
+        run: git clone --depth 1 --branch "${{ inputs.ort_version }}" --recursive --shallow-submodules https://github.com/microsoft/onnxruntime.git ort
+      - name: build with the OpenVINO provider
+        run: |
+          set -eo pipefail
+          source /opt/intel/openvino/setupvars.sh
+          cd ort
+          ./build.sh --config Release --build_shared_lib --parallel --skip_tests --compile_no_warning_as_error \
+            --use_openvino CPU --cmake_extra_defines CMAKE_INSTALL_RPATH='$ORIGIN' onnxruntime_BUILD_UNIT_TESTS=OFF
+      - name: collect and PROVE the provider loads from inside the archive
+        run: |
+          set -euo pipefail
+          B=ort/build/Linux/Release
+          mkdir -p dist
+          cp -P $B/libonnxruntime.so* $B/libonnxruntime_providers_openvino.so $B/libonnxruntime_providers_shared.so dist/
+          cp -P /opt/intel/openvino/runtime/lib/intel64/*.so* dist/
+          cp -P /opt/intel/openvino/runtime/3rdparty/tbb/lib/libtbb*.so* dist/ 2>/dev/null || true
+          sudo apt-get install -y patchelf >/dev/null
+          for f in dist/*.so*; do [ -L "$f" ] || patchelf --set-rpath '$ORIGIN' "$f"; done
+          mkdir -p dist/openvino-licensing
+          cp /opt/intel/openvino/docs/licensing/* dist/openvino-licensing/ 2>/dev/null || cp -r /opt/intel/openvino/licensing/* dist/openvino-licensing/
+          cp ort/LICENSE dist/LICENSE.txt && cp ort/ThirdPartyNotices.txt dist/ThirdPartyNotices.txt
+          test -f dist/libonnxruntime_providers_openvino.so || { echo "the OpenVINO provider was not built"; exit 1; }
+          test -f dist/libopenvino_intel_gpu_plugin.so || { echo "Intel's GPU plugin is missing"; exit 1; }
+          test -f dist/libopenvino_intel_cpu_plugin.so || { echo "Intel's CPU plugin is missing (MasterTask's CI proof runs on it)"; exit 1; }
+          # Every dependency of the provider must resolve INSIDE the archive, with no OpenVINO environment set.
+          env -i LD_LIBRARY_PATH= ldd dist/libonnxruntime_providers_openvino.so | tee /tmp/ldd.txt
+          ! grep -q "not found" /tmp/ldd.txt || { echo "🔴 the provider does not load from the archive alone"; exit 1; }
+          ls -la dist
+          tar czf onnxruntime-openvino-linux-x64.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with: { name: onnxruntime-openvino-linux-x64, path: onnxruntime-openvino-linux-x64.tar.gz }
+
+  migraphx:
+    name: onnxruntime-migraphx-linux-x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    steps:
+      - name: free disk (ROCm and an ONNX Runtime build together need ~35 GB)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost && df -h /
+      - name: ROCm ${{ env.ROCM_VERSION }} with MIGraphX (AMD's apt repository)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
+          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends migraphx migraphx-dev rocm-dev
+          df -h /
+      - name: fetch the pinned ONNX Runtime source
+        run: git clone --depth 1 --branch "${{ inputs.ort_version }}" --recursive --shallow-submodules https://github.com/microsoft/onnxruntime.git ort
+      - name: build with the MIGraphX provider
+        run: |
+          set -eo pipefail
+          cd ort
+          ./build.sh --config Release --build_shared_lib --parallel --skip_tests --compile_no_warning_as_error \
+            --use_migraphx --migraphx_home /opt/rocm --cmake_extra_defines CMAKE_INSTALL_RPATH='$ORIGIN' onnxruntime_BUILD_UNIT_TESTS=OFF
+      - name: collect and PROVE the provider is there
+        run: |
+          set -euo pipefail
+          B=ort/build/Linux/Release
+          mkdir -p dist
+          cp -P $B/libonnxruntime.so* $B/libonnxruntime_providers_migraphx.so $B/libonnxruntime_providers_shared.so dist/
+          test -f dist/libonnxruntime_providers_migraphx.so || { echo "the MIGraphX provider was not built"; exit 1; }
+          ldd dist/libonnxruntime_providers_migraphx.so | tee /tmp/ldd.txt
+          grep -q "libmigraphx" /tmp/ldd.txt || { echo "the provider does not link MIGraphX — not a MIGraphX build"; exit 1; }
+          cp ort/LICENSE dist/LICENSE.txt && cp ort/ThirdPartyNotices.txt dist/ThirdPartyNotices.txt
+          printf 'This build needs AMD ROCm %s with MIGraphX installed on the machine (repo.radeon.com); ROCm is not bundled.\n' "$ROCM_VERSION" > dist/REQUIRES-ROCM.txt
+          ls -la dist
+          tar czf onnxruntime-migraphx-linux-x64.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with: { name: onnxruntime-migraphx-linux-x64, path: onnxruntime-migraphx-linux-x64.tar.gz }
+
+  publish:
+    needs: [openvino, migraphx]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: publish what built
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          ls dist/*.tar.gz >/dev/null 2>&1 || { echo "nothing built"; exit 1; }
+          gh release create "onnxruntime-${{ inputs.ort_version }}-linux-gpu" dist/*.tar.gz \
+            --title "ONNX Runtime ${{ inputs.ort_version }} for Linux — OpenVINO and MIGraphX" \
+            --notes "Built from ONNX Runtime's pinned tag against the versions its own CI uses: OpenVINO 2025.2.0 (verified against Intel's SHA-256, runtime and licensing bundled, every provider dependency resolving inside the archive) and ROCm $ROCM_VERSION MIGraphX (not bundled — install ROCm on the machine). The runners have no GPU, so this proves the build and its linkage, not inference." \
+            --repo "${{ github.repository }}"
