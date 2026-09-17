@@ -147,9 +147,17 @@ jobs:
           ls -la dist
           ls dist/*.tar.gz >/dev/null 2>&1 || { echo "nothing built"; exit 1; }
           TAG="onnxruntime-${{ inputs.ort_version }}-linux-gpu"
-          # A re-run adds what it built to the release an earlier run made, replacing an asset of the same name.
+          # A re-run ADDS what the release lacks and never replaces an asset: a version identifies bytes (VAULT's rule),
+          # and a from-source build is not reproducible, so replacing one would change the bytes behind a digest already read.
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tar.gz --clobber --repo "${{ github.repository }}"
+            have=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name')
+            for f in dist/*.tar.gz; do
+              if printf '%s\n' "$have" | grep -qx "$(basename "$f")"; then
+                echo "$(basename "$f") is already published under $TAG — kept as it is"
+              else
+                gh release upload "$TAG" "$f" --repo "${{ github.repository }}"
+              fi
+            done
             exit 0
           fi
           gh release create "$TAG" dist/*.tar.gz \
