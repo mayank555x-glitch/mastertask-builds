@@ -25,12 +25,15 @@ on:
         required: true
         default: "v1.9.1"
       cuda_version:
-        description: "CUDA toolkit version"
+        description: "CUDA toolkit version (12.x builds the cuda12 artifacts, 13.x the cuda13 ones — H32 decision 4)"
         required: true
         default: "12.4.0"
 
 permissions:
   contents: write
+
+env:
+  CUDA_MAJOR: ${{ startsWith(inputs.cuda_version, '13.') && '13' || '12' }}
 
 jobs:
   build:
@@ -47,7 +50,7 @@ jobs:
       # ships on 24.04, and nvcc rejects it outright — "unsupported GNU version". Pinning the runner is
       # cheaper than pinning a compiler inside it.
       - name: CUDA toolkit ${{ inputs.cuda_version }}
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.36 # v0.2.36 lists CUDA 13.0.0-13.2.2
         with:
           cuda: ${{ inputs.cuda_version }}
           method: network
@@ -119,12 +122,15 @@ jobs:
           done
           ls -la dist
           cp src/LICENSE dist/LICENSE.txt 2>/dev/null || cp src/LICENSE.txt dist/ 2>/dev/null || true
-          tar czf ${{ matrix.engine }}-cuda12-linux-x64.tar.gz -C dist .
+          # 🔴 THE LABEL IS THE TOOLKIT'S MAJOR VERSION, never typed: a CUDA 13 build published as `cuda12` would be ranked
+          # for Pascal cards whose kernels CUDA 13 dropped (llama.cpp b9964 ggml/src/ggml-cuda/CMakeLists.txt).
+          LABEL="cuda${CUDA_MAJOR}"
+          tar czf ${{ matrix.engine }}-${LABEL}-linux-x64.tar.gz -C dist .
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.engine }}-cuda-linux
-          path: ${{ matrix.engine }}-cuda12-linux-x64.tar.gz
+          path: ${{ matrix.engine }}-cuda*-linux-x64.tar.gz
 
   publish:
     needs: build
@@ -138,7 +144,10 @@ jobs:
         run: |
           set -euo pipefail
           ls -la dist
-          gh release create "cuda-linux-llama-${{ inputs.llama_version }}-whisper-${{ inputs.whisper_version }}" dist/* \
+          # CUDA 12 keeps its original tag so VAULT's existing source still resolves; CUDA 13 gets its own.
+          TAG="cuda-linux-llama-${{ inputs.llama_version }}-whisper-${{ inputs.whisper_version }}"
+          if [ "${CUDA_MAJOR}" != "12" ]; then TAG="cuda${CUDA_MAJOR}-linux-llama-${{ inputs.llama_version }}-whisper-${{ inputs.whisper_version }}"; fi
+          gh release create "$TAG" dist/* \
             --title "llama.cpp ${{ inputs.llama_version }} + whisper.cpp ${{ inputs.whisper_version }} — Linux CUDA ${{ inputs.cuda_version }}" \
             --notes "Neither upstream publishes a Linux CUDA build. llama.cpp ships win-cuda, ubuntu-rocm, ubuntu-sycl, ubuntu-vulkan and ubuntu-arm64; whisper.cpp's ubuntu assets are CPU only. On a Linux host with an NVIDIA card that left chat and transcription on the CPU while ONNX used the GPU beside them.
           Built from each upstream's pinned tag with -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=all-major, and verified to LINK against CUDA and to export the ggml_backend_cuda symbols — a CPU-only fallback compiles perfectly and would otherwise ship wearing a cuda12 label. The CUDA runtime libraries are bundled so the artifact is self-contained, as the Windows build is.

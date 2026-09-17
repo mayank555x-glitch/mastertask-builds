@@ -8,6 +8,9 @@ exactly the same digest-checked path as every other artifact in its catalog.
 |---|---|
 | [`ffmpeg.yml`](.github/workflows/ffmpeg.yml) | Nobody publishes an **LGPL** ffmpeg for macOS, and no one publishes any ffmpeg for **Windows ARM64** |
 | [`whisper.yml`](.github/workflows/whisper.yml) | whisper.cpp publishes no **Windows ARM64** binary |
+| [`cuda-linux.yml`](.github/workflows/cuda-linux.yml) | Neither llama.cpp nor whisper.cpp publishes a **Linux CUDA** build; run with a 13.x toolkit it builds the **CUDA 13** ones NVIDIA's Blackwell cards need |
+| [`whisper-gpu.yml`](.github/workflows/whisper-gpu.yml) | whisper.cpp publishes no **Vulkan** build (AMD, Intel, NVIDIA through one library) and no **CUDA 13** Windows build |
+| [`onnxruntime-windows-gpu.yml`](.github/workflows/onnxruntime-windows-gpu.yml) | ONNX Runtime's **DirectML** and **OpenVINO** Windows builds exist only as NuGet packages; repackaged with their vendors' licence texts after checking NuGet's SHA-512 |
 
 ## ffmpeg
 

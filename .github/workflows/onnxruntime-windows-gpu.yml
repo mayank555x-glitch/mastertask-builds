@@ -1,0 +1,95 @@
+# Repackages ONNX Runtime's Windows GPU builds — DirectML (NVIDIA, AMD and Intel cards) and OpenVINO (Intel) — from the
+# packages their makers publish on NuGet, as release assets MasterTask's catalog verifies like every other artifact
+# (H32 decision 2). ONNX Runtime's GitHub releases carry neither.
+#
+# 🔴 NOTHING IS REPACKAGED UNVERIFIED. Each .nupkg is checked against the SHA-512 NuGet's own catalog publishes for that
+# exact id and version before a byte of it is used; a mismatch fails the run.
+#
+# 🔴 THE VENDORS' TERMS TRAVEL INSIDE EVERY COPY. DirectML is Microsoft's own licence and ONNX Runtime's OpenVINO package
+# carries Intel's runtime; both are decided in MasterTask's plan (§16.2) — shipped with their texts, shown on Packages,
+# and put to one legal review. Debug builds, symbols and import libraries are left out: nothing loads them.
+name: ONNX Runtime Windows GPU (DirectML, OpenVINO) from NuGet
+
+on:
+  workflow_dispatch:
+    inputs:
+      ort_version:
+        description: "ONNX Runtime version (the onnxruntime_go API MasterTask links)"
+        required: true
+        default: "1.23.0"
+      directml_version:
+        description: "Microsoft.AI.DirectML version ONNX Runtime's DirectML package is built against"
+        required: true
+        default: "1.15.4"
+
+permissions:
+  contents: write
+
+jobs:
+  repack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: fetch and verify against NuGet's published hash
+        run: |
+          set -euo pipefail
+          fetch() { # id version
+            local id="$1" v="$2" lid; lid=$(echo "$1" | tr 'A-Z' 'a-z')
+            curl -fsSL -o "$lid.$v.nupkg" "https://api.nuget.org/v3-flatcontainer/$lid/$v/$lid.$v.nupkg"
+            local reg entry want algo got
+            reg=$(curl -fsSL "https://api.nuget.org/v3/registration5-semver1/$lid/$v.json")
+            entry=$(echo "$reg" | jq -r '.catalogEntry')
+            want=$(curl -fsSL "$entry" | jq -r '.packageHash')
+            algo=$(curl -fsSL "$entry" | jq -r '.packageHashAlgorithm')
+            [ "$algo" = "SHA512" ] || { echo "unexpected hash algorithm $algo for $id $v"; exit 1; }
+            got=$(openssl dgst -sha512 -binary "$lid.$v.nupkg" | base64 -w0)
+            [ "$got" = "$want" ] || { echo "🔴 $id $v does not match NuGet's published SHA-512"; exit 1; }
+            echo "✓ $id $v matches NuGet's SHA-512 $want"
+          }
+          fetch Microsoft.ML.OnnxRuntime.DirectML "${{ inputs.ort_version }}"
+          fetch Microsoft.AI.DirectML "${{ inputs.directml_version }}"
+          fetch Intel.ML.OnnxRuntime.OpenVino "${{ inputs.ort_version }}"
+
+      - name: DirectML build
+        run: |
+          set -euo pipefail
+          V="${{ inputs.ort_version }}"; D="${{ inputs.directml_version }}"
+          mkdir -p ort dml out/directml
+          unzip -q "microsoft.ml.onnxruntime.directml.$V.nupkg" -d ort
+          unzip -q "microsoft.ai.directml.$D.nupkg" -d dml
+          cp ort/runtimes/win-x64/native/onnxruntime.dll ort/runtimes/win-x64/native/onnxruntime_providers_shared.dll out/directml/
+          cp dml/bin/x64-win/DirectML.dll out/directml/
+          cp ort/LICENSE out/directml/LICENSE-onnxruntime.txt
+          cp ort/ThirdPartyNotices.txt out/directml/ThirdPartyNotices-onnxruntime.txt
+          cp dml/LICENSE.txt out/directml/LICENSE-DirectML.txt
+          cp dml/ThirdPartyNotices.txt out/directml/ThirdPartyNotices-DirectML.txt
+          # 🔴 THE DirectML PROVIDER MUST BE IN THIS onnxruntime.dll — the CPU package's dll has none, and would ship as `directml`.
+          strings -el out/directml/onnxruntime.dll | grep -q "DmlExecutionProvider" || strings out/directml/onnxruntime.dll | grep -q "DmlExecutionProvider" || {
+            echo "onnxruntime.dll carries no DmlExecutionProvider — not the DirectML build"; exit 1; }
+          ls -la out/directml
+          (cd out/directml && zip -qr "../../onnxruntime-directml-win-x64-$V.zip" .)
+
+      - name: OpenVINO build
+        run: |
+          set -euo pipefail
+          V="${{ inputs.ort_version }}"
+          mkdir -p ov out/openvino
+          unzip -q "intel.ml.onnxruntime.openvino.$V.nupkg" -d ov
+          # Everything the runtime loads; the *_debug.dll twins are left out.
+          find ov/runtimes/win-x64/native -maxdepth 1 -name '*.dll' ! -name '*_debug.dll' -exec cp {} out/openvino/ \;
+          for f in LICENSE README.md Privacy.md ThirdPartyNotices.txt; do cp "ov/$f" "out/openvino/$f-openvino-package.txt"; done
+          test -f out/openvino/onnxruntime_providers_openvino.dll || { echo "the OpenVINO provider is missing"; exit 1; }
+          test -f out/openvino/openvino_intel_gpu_plugin.dll || { echo "Intel's GPU plugin is missing"; exit 1; }
+          test -f out/openvino/openvino_intel_cpu_plugin.dll || { echo "Intel's CPU plugin is missing (the CI proof runs on it)"; exit 1; }
+          ls -la out/openvino
+          (cd out/openvino && zip -qr "../../onnxruntime-openvino-win-x64-$V.zip" .)
+          sha256sum onnxruntime-*.zip
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "onnxruntime-${{ inputs.ort_version }}-windows-gpu" onnxruntime-*-win-x64-*.zip \
+            --title "ONNX Runtime ${{ inputs.ort_version }} for Windows — DirectML and OpenVINO" \
+            --notes "Repackaged from NuGet (Microsoft.ML.OnnxRuntime.DirectML ${{ inputs.ort_version }} + Microsoft.AI.DirectML ${{ inputs.directml_version }}; Intel.ML.OnnxRuntime.OpenVino ${{ inputs.ort_version }}), each verified against the SHA-512 NuGet publishes. Licence texts and third-party notices of each vendor are inside each archive. Debug DLLs, symbols and import libraries are omitted." \
+            --repo "${{ github.repository }}"
