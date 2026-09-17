@@ -76,7 +76,23 @@ jobs:
           unzip -q "intel.ml.onnxruntime.openvino.$V.nupkg" -d ov
           # Everything the runtime loads; the *_debug.dll twins are left out.
           find ov/runtimes/win-x64/native -maxdepth 1 -name '*.dll' ! -name '*_debug.dll' -exec cp {} out/openvino/ \;
-          for f in LICENSE README.md Privacy.md ThirdPartyNotices.txt; do cp "ov/$f" "out/openvino/$f-openvino-package.txt"; done
+          cp ov/LICENSE out/openvino/LICENSE-onnxruntime.txt
+          cp ov/ThirdPartyNotices.txt out/openvino/ThirdPartyNotices-onnxruntime.txt
+          cp ov/Privacy.md out/openvino/Privacy-onnxruntime.md
+          # 🔴 THE PACKAGE DECLARES ONLY ONNX RUNTIME'S MIT LICENCE, BUT IT CARRIES INTEL'S OpenVINO RUNTIME (openvino.dll and
+          # its plugins), whose terms are Intel's distribution licence. They come from Intel's own archive of the SAME
+          # OpenVINO release the DLLs report (2025.3.0-19807-44526285f24), verified against Intel's published SHA-256.
+          OVZIP=openvino_toolkit_windows_2025.3.0.19807.44526285f24_x86_64.zip
+          OVURL="https://storage.openvinotoolkit.org/repositories/openvino/packages/2025.3/windows/$OVZIP"
+          strings ov/runtimes/win-x64/native/openvino.dll | grep -q "2025.3.0-19807-44526285f24" || {
+            echo "🔴 the bundled openvino.dll is not OpenVINO 2025.3.0-19807 — its licensing must come from its own release"; exit 1; }
+          curl -fsSL -o "$OVZIP" "$OVURL"
+          [ "$(sha256sum "$OVZIP" | awk '{print $1}')" = "$(curl -fsSL "$OVURL.sha256" | awk '{print $1}')" ] || {
+            echo "🔴 Intel's OpenVINO archive does not match its SHA-256"; exit 1; }
+          mkdir -p ovzip out/openvino/openvino-licensing
+          unzip -q "$OVZIP" '*/docs/licensing/*' -d ovzip
+          cp ovzip/*/docs/licensing/* out/openvino/openvino-licensing/
+          test -f out/openvino/openvino-licensing/EULA.txt || { echo "Intel's EULA is missing from its own archive"; exit 1; }
           test -f out/openvino/onnxruntime_providers_openvino.dll || { echo "the OpenVINO provider is missing"; exit 1; }
           test -f out/openvino/openvino_intel_gpu_plugin.dll || { echo "Intel's GPU plugin is missing"; exit 1; }
           test -f out/openvino/openvino_intel_cpu_plugin.dll || { echo "Intel's CPU plugin is missing (the CI proof runs on it)"; exit 1; }
@@ -89,7 +105,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "onnxruntime-${{ inputs.ort_version }}-windows-gpu" onnxruntime-*-win-x64-*.zip \
+          # r2: the OpenVINO archive now carries Intel's licensing from its own OpenVINO release (r1 carried only ONNX Runtime's).
+          gh release create "onnxruntime-${{ inputs.ort_version }}-windows-gpu-r2" onnxruntime-*-win-x64-*.zip \
             --title "ONNX Runtime ${{ inputs.ort_version }} for Windows — DirectML and OpenVINO" \
             --notes "Repackaged from NuGet (Microsoft.ML.OnnxRuntime.DirectML ${{ inputs.ort_version }} + Microsoft.AI.DirectML ${{ inputs.directml_version }}; Intel.ML.OnnxRuntime.OpenVino ${{ inputs.ort_version }}), each verified against the SHA-512 NuGet publishes. Licence texts and third-party notices of each vendor are inside each archive. Debug DLLs, symbols and import libraries are omitted." \
             --repo "${{ github.repository }}"
