@@ -118,7 +118,9 @@ jobs:
         with:
           cuda: ${{ inputs.cuda_version }}
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration", "nvtx"]'
+          # 🔴 `crt`: CUDA 13 moved its C runtime headers (crt/host_config.h) into their own component — without it nvcc
+          # cannot compile CMake's first test file (measured: "Cannot open include file: 'crt/host_config.h'").
+          sub-packages: '["nvcc", "cudart", "crt", "cublas", "cublas_dev", "visual_studio_integration", "nvtx"]'
       - name: fetch the pinned source
         shell: bash
         run: |
