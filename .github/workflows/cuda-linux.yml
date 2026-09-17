@@ -28,6 +28,13 @@ on:
         description: "CUDA toolkit version (12.x builds the cuda12 artifacts, 13.x the cuda13 ones — H32 decision 4)"
         required: true
         default: "12.4.0"
+      revision:
+        description: >-
+          Suffix for the release tag when the SAME upstream versions must be rebuilt (e.g. r2). Publishing never
+          replaces an asset, because a version identifies bytes — so a corrected build needs its own tag, and this
+          is how it gets one. Left empty for a first build.
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -104,7 +111,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find build -name '*.so' -exec cp {} dist/ \;
+          # 🔴🔴 `*.so*`, AND `cp -P`. THE FIRST VERSION SHIPPED TWO BUILDS THAT COULD NOT LOAD ANYWHERE.
+          # It was `find build -name '*.so' -exec cp {} dist/ \;`, which is wrong twice over: `-name '*.so'`
+          # matches the bare development name only, never `libggml.so.0` or `libggml.so.0.15.1`, and plain `cp`
+          # FOLLOWS a symlink, so `libggml.so` — a link to the versioned file — was copied as a real file under
+          # the link's name while the two names the loader actually asks for were left behind.
+          #
+          # The loader asks for the SONAME. `libwhisper.so` records `libggml.so.0` as a needed library, so every
+          # machine answered `libggml.so.0: cannot open shared object file: No such file or directory`. Measured
+          # on the published artifacts of 2026-09-18: llama-cuda13-linux-x64 and whisper-cuda13-linux-x64 both
+          # carried a single 55 KB `libggml.so` and no `.so.0` at all, while the upstream CPU and Vulkan builds
+          # beside them carried the full chain `libggml.so` → `.so.0` → `.so.0.15.1`.
+          #
+          # `whisper-gpu.yml` has had this right since it was written (`-name '*.so*' -exec cp -P`); this file is
+          # the one that did not, and nothing compared them.
+          find build -name '*.so*' -exec cp -P {} dist/ \;
           ls -la dist
           test -f "dist/${{ matrix.entry }}" || { echo "${{ matrix.entry }} was not produced"; exit 1; }
 
@@ -119,6 +140,48 @@ jobs:
           echo "--- CUDA symbols present? ---"
           nm -D --defined-only dist/*.so 2>/dev/null | grep -qi "ggml_backend_cuda" || {
             echo "the CUDA backend symbols are absent — GGML_CUDA did not take"; exit 1; }
+
+          # 🔴🔴 AND EVERY LIBRARY IT ASKS FOR IS ACTUALLY THERE. The `ldd` above already PRINTED
+          # "libggml.so.0 => not found" and nothing read it: it greps for `cuda|cublas` and is satisfied by a
+          # match anywhere, so a build that could not load a single symbol passed the step named "PROVE it is a
+          # CUDA build". A guard that runs on the right file and asks the wrong question is worse than none —
+          # it is the reason two dead artifacts were signed, published, and verified byte-for-byte.
+          #
+          # `libcuda.so.1` is the DRIVER and is deliberately allowed to be missing: no build machine has a GPU,
+          # and every customer machine with an NVIDIA card has it. Anything else unresolved is a broken package.
+          echo "--- does every needed library resolve? ---"
+          MISSING=$(cd dist && ldd ./*.so 2>/dev/null | grep 'not found' | grep -v 'libcuda\.so\.1' | sort -u || true)
+          if [ -n "$MISSING" ]; then
+            echo "🔴 these artifacts cannot be loaded — a needed library is not in the package:"
+            echo "$MISSING"
+            exit 1
+          fi
+
+          # And the entrypoint OPENS. `ldd` reads a table; `dlopen` is what the product does, and it is the only
+          # thing that proves the package is whole. The one thing a build machine legitimately cannot satisfy is
+          # the NVIDIA driver, so a failure that names `libcuda.so.1` is reported and accepted — and ANY OTHER
+          # failure is a broken package, which is exactly the case that shipped.
+          echo "--- does the entrypoint actually dlopen? ---"
+          printf '%s\n' \
+            '#include <dlfcn.h>' \
+            '#include <stdio.h>' \
+            'int main(int argc, char **argv) {' \
+            '  void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);' \
+            '  if (!h) { fprintf(stderr, "%s\n", dlerror()); return 1; }' \
+            '  printf("dlopen ok\n"); return 0; }' > /tmp/opencheck.c
+          cc -o /tmp/opencheck /tmp/opencheck.c -ldl
+          OPENERR=$( cd dist && LD_LIBRARY_PATH="$PWD" /tmp/opencheck "./${{ matrix.entry }}" 2>&1 >/dev/null ) || {
+            case "$OPENERR" in
+              *libcuda.so.1*)
+                echo "   ${{ matrix.entry }} opened as far as this machine can take it; only the NVIDIA driver"
+                echo "   (libcuda.so.1) is missing, which no build runner has: $OPENERR" ;;
+              *)
+                echo "🔴 ${{ matrix.entry }} does not load: $OPENERR"
+                echo "   It would fail on every customer machine exactly as it fails here, and nothing"
+                echo "   downstream — signing, publishing, verifybytes — can see it: they all check bytes."
+                exit 1 ;;
+            esac
+          }
 
           # The CUDA runtime libraries themselves, so the artifact is self-contained exactly like the
           # Windows one (which merges cudart alongside the engine).
@@ -152,6 +215,9 @@ jobs:
           # CUDA 12 keeps its original tag so VAULT's existing source still resolves; CUDA 13 gets its own.
           TAG="cuda-linux-llama-${{ inputs.llama_version }}-whisper-${{ inputs.whisper_version }}"
           if [ "${CUDA_MAJOR}" != "12" ]; then TAG="cuda${CUDA_MAJOR}-linux-llama-${{ inputs.llama_version }}-whisper-${{ inputs.whisper_version }}"; fi
+          # A rebuild of the same upstream versions takes its own tag: the assets below are never replaced, so
+          # corrected bytes under the old tag would be silently ignored and the broken ones kept.
+          if [ -n "${{ inputs.revision }}" ]; then TAG="${TAG}-${{ inputs.revision }}"; fi
           # 🔴 ONE ASSET AT A TIME, WITH RETRIES, AND NEVER A REPLACEMENT. A ~1 GB upload answered HTTP 500 ("Error saving
           # asset") and took the whole publish with it, leaving an empty draft; and a version identifies bytes, so an asset
           # already published is kept as it is. The release is published only once every asset is on it.
