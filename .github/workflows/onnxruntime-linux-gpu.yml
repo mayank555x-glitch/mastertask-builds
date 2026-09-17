@@ -2,7 +2,8 @@
 # from ONNX Runtime's pinned source, and publishes them as release assets (MasterTask H32 decision 2). ONNX Runtime
 # publishes these two only as Python wheels, which MasterTask cannot load.
 #
-# 🔴 THE VERSIONS ARE ONNX RUNTIME'S OWN: OpenVINO 2025.2.0 and ROCm 6.4 are what v1.23.0's CI builds these providers
+# 🔴 THE VERSIONS ARE ONNX RUNTIME'S OWN WHERE THEY BUILD: OpenVINO 2025.2.0 as v1.23.0's CI builds it; ROCm 7.0.2 for
+# MIGraphX, because v1.23.0's CI image names ROCm 6.4 while its code needs MIGraphX 2.13 (see ROCM_VERSION). v1.23.0's CI builds these providers
 # against (`tools/ci_build/github/linux/docker/inference/x86_64/python/openvino/Dockerfile`,
 # `migraphx-ci-pipeline-env.Dockerfile` at the tag), read 2026-09-17 — never "latest", which ONNX Runtime has not tested.
 #
@@ -30,7 +31,9 @@ env:
   # 🔴 THE UBUNTU 24.04 ARCHIVE ON AN UBUNTU 24.04 RUNNER: ONNX Runtime's OpenVINO provider includes <format>, which GCC 11
   # (Ubuntu 22.04) does not have — measured, `ov_factory.cc: fatal error: format: No such file or directory`.
   OPENVINO_URL: https://storage.openvinotoolkit.org/repositories/openvino/packages/2025.2/linux/openvino_toolkit_ubuntu24_2025.2.0.19140.c01cd93e24d_x86_64.tgz
-  ROCM_VERSION: "6.4"
+  # 🔴 ROCm 7.0.2, NOT 6.4: ONNX Runtime 1.23.0 calls migraphx::quantize_bf16, which MIGraphX 2.12 (ROCm 6.4.x) has only
+  # as an internal header and 2.13 (ROCm 7.0) exports — measured: "'quantize_bf16' is not a member of 'migraphx'" on 6.4.
+  ROCM_VERSION: "7.0.2"
 
 jobs:
   openvino:
@@ -94,8 +97,8 @@ jobs:
           set -euo pipefail
           curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
-          # AMD's graphics libraries (rccl needs libdrm-amdgpu-amdgpu1 and libdrm2-amdgpu), from AMD's own install steps.
-          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/$ROCM_VERSION/ubuntu jammy main" | sudo tee /etc/apt/sources.list.d/amdgpu.list
+          # AMD's graphics libraries, from AMD's own ROCm 7 install steps (repo.radeon.com/graphics/<version>).
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/graphics/$ROCM_VERSION/ubuntu jammy main" | sudo tee /etc/apt/sources.list.d/amdgpu.list
           printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update -y
           # rocm-libs as ONNX Runtime's own CI image installs it: MIGraphX's CMake config needs MIOpen's (measured).
@@ -107,17 +110,12 @@ jobs:
         run: |
           set -eo pipefail
           cd ort
-          # 🔴 MIGraphX 2.12.0 (ROCm 6.4.0) installs migraphx/version.h under lib/migraphx/include, which its CMake target
-          # does not export, and ONNX Runtime includes it (measured: "fatal error: migraphx/version.h"). That directory holds
-          # only the library's internal headers — no migraphx.h/.hpp to shadow — and CPLUS_INCLUDE_PATH is searched after
-          # every -I, so the public headers still win.
-          export CPLUS_INCLUDE_PATH=/opt/rocm/lib/migraphx/include
           ./build.sh --config Release --build_shared_lib --parallel --skip_tests --compile_no_warning_as_error \
             --use_migraphx --migraphx_home /opt/rocm \
             --cmake_extra_defines CMAKE_INSTALL_RPATH='$ORIGIN' onnxruntime_BUILD_UNIT_TESTS=OFF \
             "GPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201;gfx906;gfx908"
           # 🔴 GPU_TARGETS NAMED: the runner has no AMD card, so ROCm's detection fails ("Failed to get device count"); these
-          # are the Radeon and Instinct generations ROCm 6.4 supports.
+          # name Radeon and Instinct generations so CMake configures; ONNX Runtime compiles no GPU kernels of its own here.
       - name: collect and PROVE the provider is there
         run: |
           set -euo pipefail
