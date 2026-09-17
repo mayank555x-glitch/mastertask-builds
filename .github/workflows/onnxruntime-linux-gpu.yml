@@ -27,13 +27,15 @@ permissions:
   contents: write
 
 env:
-  OPENVINO_URL: https://storage.openvinotoolkit.org/repositories/openvino/packages/2025.2/linux/openvino_toolkit_ubuntu22_2025.2.0.19140.c01cd93e24d_x86_64.tgz
+  # 🔴 THE UBUNTU 24.04 ARCHIVE ON AN UBUNTU 24.04 RUNNER: ONNX Runtime's OpenVINO provider includes <format>, which GCC 11
+  # (Ubuntu 22.04) does not have — measured, `ov_factory.cc: fatal error: format: No such file or directory`.
+  OPENVINO_URL: https://storage.openvinotoolkit.org/repositories/openvino/packages/2025.2/linux/openvino_toolkit_ubuntu24_2025.2.0.19140.c01cd93e24d_x86_64.tgz
   ROCM_VERSION: "6.4"
 
 jobs:
   openvino:
     name: onnxruntime-openvino-linux-x64
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 330
     steps:
       - name: free disk (an ONNX Runtime build needs ~25 GB)
@@ -94,7 +96,8 @@ jobs:
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
           printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends migraphx migraphx-dev rocm-dev
+          # rocm-libs as ONNX Runtime's own CI image installs it: MIGraphX's CMake config needs MIOpen's (measured).
+          sudo apt-get install -y --no-install-recommends migraphx migraphx-dev rocm-dev rocm-libs
           df -h /
       - name: fetch the pinned ONNX Runtime source
         run: git clone --depth 1 --branch "${{ inputs.ort_version }}" --recursive --shallow-submodules https://github.com/microsoft/onnxruntime.git ort
@@ -103,7 +106,11 @@ jobs:
           set -eo pipefail
           cd ort
           ./build.sh --config Release --build_shared_lib --parallel --skip_tests --compile_no_warning_as_error \
-            --use_migraphx --migraphx_home /opt/rocm --cmake_extra_defines CMAKE_INSTALL_RPATH='$ORIGIN' onnxruntime_BUILD_UNIT_TESTS=OFF
+            --use_migraphx --migraphx_home /opt/rocm \
+            --cmake_extra_defines CMAKE_INSTALL_RPATH='$ORIGIN' onnxruntime_BUILD_UNIT_TESTS=OFF \
+            "GPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201;gfx906;gfx908"
+          # 🔴 GPU_TARGETS NAMED: the runner has no AMD card, so ROCm's detection fails ("Failed to get device count"); these
+          # are the Radeon and Instinct generations ROCm 6.4 supports.
       - name: collect and PROVE the provider is there
         run: |
           set -euo pipefail

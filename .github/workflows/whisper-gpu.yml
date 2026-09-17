@@ -120,7 +120,9 @@ jobs:
           method: network
           # 🔴 `crt`: CUDA 13 moved its C runtime headers (crt/host_config.h) into their own component — without it nvcc
           # cannot compile CMake's first test file (measured: "Cannot open include file: 'crt/host_config.h'").
-          sub-packages: '["nvcc", "cudart", "crt", "cublas", "cublas_dev", "visual_studio_integration", "nvtx"]'
+          # 🔴 `nvvm`: CUDA 13 ships nvcc's device compiler (cicc) in its own component too — without it the compiler-ID step
+          # fails inside "%CICC_PATH%\cicc" (measured on this workflow's second run).
+          sub-packages: '["nvcc", "nvvm", "cudart", "crt", "cublas", "cublas_dev", "visual_studio_integration", "nvtx"]'
       - name: fetch the pinned source
         shell: bash
         run: |
