@@ -107,6 +107,11 @@ jobs:
         run: |
           set -eo pipefail
           cd ort
+          # 🔴 MIGraphX 2.12.0 (ROCm 6.4.0) installs migraphx/version.h under lib/migraphx/include, which its CMake target
+          # does not export, and ONNX Runtime includes it (measured: "fatal error: migraphx/version.h"). That directory holds
+          # only the library's internal headers — no migraphx.h/.hpp to shadow — and CPLUS_INCLUDE_PATH is searched after
+          # every -I, so the public headers still win.
+          export CPLUS_INCLUDE_PATH=/opt/rocm/lib/migraphx/include
           ./build.sh --config Release --build_shared_lib --parallel --skip_tests --compile_no_warning_as_error \
             --use_migraphx --migraphx_home /opt/rocm \
             --cmake_extra_defines CMAKE_INSTALL_RPATH='$ORIGIN' onnxruntime_BUILD_UNIT_TESTS=OFF \
@@ -143,7 +148,13 @@ jobs:
           set -euo pipefail
           ls -la dist
           ls dist/*.tar.gz >/dev/null 2>&1 || { echo "nothing built"; exit 1; }
-          gh release create "onnxruntime-${{ inputs.ort_version }}-linux-gpu" dist/*.tar.gz \
+          TAG="onnxruntime-${{ inputs.ort_version }}-linux-gpu"
+          # A re-run adds what it built to the release an earlier run made, replacing an asset of the same name.
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz --clobber --repo "${{ github.repository }}"
+            exit 0
+          fi
+          gh release create "$TAG" dist/*.tar.gz \
             --title "ONNX Runtime ${{ inputs.ort_version }} for Linux — OpenVINO and MIGraphX" \
             --notes "Built from ONNX Runtime's pinned tag against the versions its own CI uses: OpenVINO 2025.2.0 (verified against Intel's SHA-256, runtime and licensing bundled, every provider dependency resolving inside the archive) and ROCm $ROCM_VERSION MIGraphX (not bundled — install ROCm on the machine). The runners have no GPU, so this proves the build and its linkage, not inference." \
             --repo "${{ github.repository }}"
