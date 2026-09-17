@@ -22,7 +22,7 @@ on:
       cuda_version:
         description: "CUDA toolkit for the Windows CUDA 13 build"
         required: true
-        default: "13.2.2"
+        default: "13.3.1"
 
 permissions:
   contents: write
