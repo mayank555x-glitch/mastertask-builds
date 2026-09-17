@@ -34,6 +34,11 @@ permissions:
 
 env:
   CUDA_MAJOR: ${{ startsWith(inputs.cuda_version, '13.') && '13' || '12' }}
+  # 🔴 CUDA 13 USES GGML'S OWN ARCHITECTURE LIST, NOT "all-major". all-major names Blackwell as plain `120`, which
+  # also compiles every kernel as PTX, and nvcc cannot assemble ggml's FP4 kernel as PTX ("mma with block scale not
+  # supported on sm_120" — measured on 13.2.2 and 13.3.1). ggml's default, which upstream's CUDA 13 release uses, is
+  # exactly this list: 120a-real/121a-real for Blackwell (architecture-specific, never PTX), 75+ for everything else.
+  CUDA_ARCHS: ${{ startsWith(inputs.cuda_version, '13.') && '75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real' || 'all-major' }}
 
 jobs:
   build:
@@ -83,7 +88,7 @@ jobs:
           cmake -S src -B build \
             -DGGML_CUDA=ON \
             -DGGML_NATIVE=OFF \
-            -DCMAKE_CUDA_ARCHITECTURES=all-major \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
             -DBUILD_SHARED_LIBS=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
@@ -150,6 +155,6 @@ jobs:
           gh release create "$TAG" dist/* \
             --title "llama.cpp ${{ inputs.llama_version }} + whisper.cpp ${{ inputs.whisper_version }} — Linux CUDA ${{ inputs.cuda_version }}" \
             --notes "Neither upstream publishes a Linux CUDA build. llama.cpp ships win-cuda, ubuntu-rocm, ubuntu-sycl, ubuntu-vulkan and ubuntu-arm64; whisper.cpp's ubuntu assets are CPU only. On a Linux host with an NVIDIA card that left chat and transcription on the CPU while ONNX used the GPU beside them.
-          Built from each upstream's pinned tag with -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=all-major, and verified to LINK against CUDA and to export the ggml_backend_cuda symbols — a CPU-only fallback compiles perfectly and would otherwise ship wearing a cuda12 label. The CUDA runtime libraries are bundled so the artifact is self-contained, as the Windows build is.
+          Built from each upstream's pinned tag with -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}, and verified to LINK against CUDA and to export the ggml_backend_cuda symbols — a CPU-only fallback compiles perfectly and would otherwise ship wearing a cuda12 label. The CUDA runtime libraries are bundled so the artifact is self-contained, as the Windows build is.
           The runner has no GPU, so this proves the build and the linkage, not inference." \
             --repo "${{ github.repository }}"

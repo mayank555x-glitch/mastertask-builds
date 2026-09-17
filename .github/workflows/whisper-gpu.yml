@@ -133,8 +133,9 @@ jobs:
       - name: configure and build
         shell: pwsh
         run: |
-          # 🔴 CUDA 13 dropped the Maxwell, Pascal and Volta kernels; "all-major" builds what this toolkit supports.
-          cmake -S src -B build -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON -DCMAKE_CUDA_ARCHITECTURES=all-major `
+          # 🔴 GGML'S OWN CUDA 13 ARCHITECTURE LIST, NOT "all-major": all-major names Blackwell as plain 120, which also
+          # compiles every kernel as PTX, and nvcc cannot assemble the FP4 kernel as PTX (measured, cuda-linux.yml).
+          cmake -S src -B build -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON "-DCMAKE_CUDA_ARCHITECTURES=75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real" `
             -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF
           cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS --target whisper
       - name: collect and PROVE it is a CUDA build
