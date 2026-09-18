@@ -126,6 +126,16 @@ jobs:
           # `whisper-gpu.yml` has had this right since it was written (`-name '*.so*' -exec cp -P`); this file is
           # the one that did not, and nothing compared them.
           find build -name '*.so*' -exec cp -P {} dist/ \;
+
+          # 🔴🔴 AND THE LOADER MUST LOOK BESIDE THE FILE. cmake writes the BUILD TREE's own absolute path into
+          # RUNPATH — measured on the r2 artifacts: `/home/runner/work/mastertask-builds/mastertask-builds/build/bin:`
+          # — a directory that exists on no customer machine. The trailing colon is an EMPTY entry, which the loader
+          # reads as "the current working directory", so the package appears to work when something runs from inside
+          # the folder and fails everywhere else. Upstream's own builds carry `$ORIGIN`, which means "beside me", and
+          # that is what a self-contained package needs. Every real file, never the symlinks (patchelf would replace
+          # a link with a copy).
+          sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
+          find dist -maxdepth 1 -type f -name '*.so*' -exec patchelf --set-rpath '$ORIGIN' {} \;
           ls -la dist
           test -f "dist/${{ matrix.entry }}" || { echo "${{ matrix.entry }} was not produced"; exit 1; }
 
@@ -147,10 +157,20 @@ jobs:
           # CUDA build". A guard that runs on the right file and asks the wrong question is worse than none —
           # it is the reason two dead artifacts were signed, published, and verified byte-for-byte.
           #
-          # `libcuda.so.1` is the DRIVER and is deliberately allowed to be missing: no build machine has a GPU,
-          # and every customer machine with an NVIDIA card has it. Anything else unresolved is a broken package.
-          echo "--- does every needed library resolve? ---"
-          MISSING=$(cd dist && ldd ./*.so 2>/dev/null | grep 'not found' | grep -v 'libcuda\.so\.1' | sort -u || true)
+          # TWO libraries are allowed to be absent here, each for a stated reason, and nothing else is:
+          #   libcuda.so.1  — the NVIDIA DRIVER. No build machine has a GPU; every machine with the card has it.
+          #   libgomp.so.1  — GCC's OpenMP runtime, a system library. Measured: upstream's own CPU build and our
+          #                   Vulkan build both name it NEEDED and neither bundles it, so it is a pre-existing
+          #                   dependency of every ggml Linux build we ship, not something this workflow introduced.
+          # Anything else unresolved is a broken package.
+          #
+          # 🔴🔴 AND IT RUNS FROM OUTSIDE `dist`, WHICH IS THE WHOLE POINT. The first version of this check was
+          # `cd dist && ldd ./*.so`, and it PASSED on a package that could not load — because RUNPATH ended in an
+          # empty entry, the loader read that as the current directory, and the current directory was the one place
+          # every library happened to be. A check run from inside the folder tests a path the product never uses.
+          # Verified both ways on Ubuntu 24.04: from inside, `libggml.so.0 (0x00007fff…)`; from `/`, `not found`.
+          echo "--- does every needed library resolve, from somewhere that is NOT the package? ---"
+          MISSING=$(cd / && ldd "$GITHUB_WORKSPACE"/dist/*.so* 2>/dev/null | grep 'not found' | grep -vE 'libcuda\.so\.1|libgomp\.so\.1' | sort -u || true)
           if [ -n "$MISSING" ]; then
             echo "🔴 these artifacts cannot be loaded — a needed library is not in the package:"
             echo "$MISSING"
@@ -170,11 +190,13 @@ jobs:
             '  if (!h) { fprintf(stderr, "%s\n", dlerror()); return 1; }' \
             '  printf("dlopen ok\n"); return 0; }' > /tmp/opencheck.c
           cc -o /tmp/opencheck /tmp/opencheck.c -ldl
-          OPENERR=$( cd dist && LD_LIBRARY_PATH="$PWD" /tmp/opencheck "./${{ matrix.entry }}" 2>&1 >/dev/null ) || {
+          # 🔴 NO `cd dist`, AND NO LD_LIBRARY_PATH. Both would supply from outside exactly what the package must
+          # carry inside, which is the defect this check exists to catch.
+          OPENERR=$( cd / && /tmp/opencheck "$GITHUB_WORKSPACE/dist/${{ matrix.entry }}" 2>&1 >/dev/null ) || {
             case "$OPENERR" in
-              *libcuda.so.1*)
-                echo "   ${{ matrix.entry }} opened as far as this machine can take it; only the NVIDIA driver"
-                echo "   (libcuda.so.1) is missing, which no build runner has: $OPENERR" ;;
+              *libcuda.so.1*|*libgomp.so.1*)
+                echo "   ${{ matrix.entry }} opened as far as this machine can take it; only a stated system"
+                echo "   library is missing (the NVIDIA driver, or GCC's OpenMP runtime): $OPENERR" ;;
               *)
                 echo "🔴 ${{ matrix.entry }} does not load: $OPENERR"
                 echo "   It would fail on every customer machine exactly as it fails here, and nothing"
