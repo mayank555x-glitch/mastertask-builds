@@ -1,0 +1,303 @@
+# Builds stable-diffusion.cpp — MasterTask's picture engine (H24) — for the platforms its maker does not publish, and
+# publishes each as a release asset.
+#
+# 🔴 WHAT UPSTREAM SHIPS AND WHAT IT DOES NOT (leejet/stable-diffusion.cpp release master-929-3f8527a, read 2026-10-06):
+# Linux x64 CPU / Vulkan / ROCm, Windows x64 CPU / CUDA 12 / Vulkan / ROCm — and a macOS arm64 build whose minimum is
+# macOS 26 (measured: `otool -l` says `minos 26.0`), which would refuse to load on every Mac a customer has today. So:
+#   · macOS arm64 and macOS x64 (Intel), both for macOS 13.3 and later, with Metal
+#   · Linux x64 CUDA 12 and CUDA 13 (Blackwell), which upstream does not publish at all
+#   · Linux arm64 (CPU)
+#   · Linux x64 SYCL (Intel GPUs)
+#   · Windows arm64 (CPU), cross-compiled with llvm-mingw as whisper.cpp is here
+#
+# 🔴 THE ARTIFACT IS THE SHARED LIBRARY, NOT THE COMMAND-LINE TOOLS. MasterTask dlopens `libstable-diffusion` from its
+# runner subprocess. `-DSD_BUILD_SHARED_LIBS=ON` is therefore not a preference, and every ggml library it needs ships
+# beside it — the SONAME chain kept (`cp -P`), RUNPATH `$ORIGIN` (cuda-linux.yml's r2 and r3 are why).
+#
+# 🔴 BUILT FROM A GIT CHECKOUT AT THE PINNED COMMIT, NEVER A SOURCE TARBALL: ggml is a submodule, and GitHub's archive of
+# the tag leaves it out — the build would fail, or worse, find a different ggml installed on the runner.
+name: stable-diffusion.cpp (picture engine)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "stable-diffusion.cpp commit (full or short) — the product's MT_SD_COMMIT"
+        required: true
+        default: "3f8527a46c54ecf4cb4ed6003da8e8982283c73c"
+      release:
+        description: "upstream release name the commit carries (for the tag), e.g. master-929"
+        required: true
+        default: "master-929"
+      c2patool_version:
+        description: "c2patool release to build for ARM (the signing tool for Content Credentials)"
+        required: true
+        default: "0.27.22"
+      revision:
+        description: "Suffix for a rebuild of the same commit (e.g. r2) — a released asset is never replaced"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    name: sd-${{ matrix.arch }}-darwin
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x64]
+    steps:
+      - name: fetch the pinned source, with its submodules
+        run: |
+          set -euo pipefail
+          git clone --recursive --quiet https://github.com/leejet/stable-diffusion.cpp src
+          git -C src checkout --quiet "${{ inputs.commit }}"
+          git -C src submodule update --init --recursive --quiet
+          git -C src rev-parse HEAD   # recorded in the log: the exact source this build came from
+      - name: configure and build
+        run: |
+          set -euo pipefail
+          ARCH=arm64; [ "${{ matrix.arch }}" = "x64" ] && ARCH=x86_64
+          # 🔴 THE MINIMUM IS 13.3, AND IT IS THE REASON THIS JOB EXISTS: upstream's Mac build says 26.0.
+          # 🔴 METAL'S SHADERS ARE EMBEDDED, so the library needs no .metallib file beside it at run time.
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_OSX_ARCHITECTURES=$ARCH -DSD_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_BUILD_EXAMPLES=OFF -DGGML_NATIVE=OFF -DCMAKE_INSTALL_RPATH=@loader_path -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+          cmake --build build --config Release -j"$(sysctl -n hw.ncpu)"
+      - name: collect and PROVE it is what it says
+        run: |
+          set -euo pipefail
+          ARCH=arm64; [ "${{ matrix.arch }}" = "x64" ] && ARCH=x86_64
+          mkdir -p dist
+          find build -name '*.dylib' -exec cp -P {} dist/ \;
+          ls -la dist
+          test -f dist/libstable-diffusion.dylib || { echo "libstable-diffusion.dylib was not produced"; exit 1; }
+          lipo -archs dist/libstable-diffusion.dylib | grep -qw "$ARCH" || { echo "NOT a $ARCH binary"; exit 1; }
+          MINOS=$(otool -l dist/libstable-diffusion.dylib | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+          echo "minos $MINOS"
+          [ "$MINOS" = "13.3" ] || { echo "🔴 minimum macOS is $MINOS, not 13.3"; exit 1; }
+          otool -L dist/libstable-diffusion.dylib | grep -q Metal || { echo "Metal is not linked"; exit 1; }
+          if [ "$ARCH" = "arm64" ]; then
+            printf '%s\n' '#include <dlfcn.h>' '#include <stdio.h>' \
+              'int main(int c,char**v){void*h=dlopen(v[1],RTLD_NOW|RTLD_LOCAL);if(!h){fprintf(stderr,"%s\n",dlerror());return 1;}' \
+              'const char*(*f)(void)=(const char*(*)(void))dlsym(h,"sd_commit");printf("dlopen ok, commit %s\n",f?f():"?");return 0;}' > /tmp/o.c
+            cc -o /tmp/o /tmp/o.c && (cd / && /tmp/o "$GITHUB_WORKSPACE/dist/libstable-diffusion.dylib")
+          fi
+          cp src/LICENSE dist/LICENSE.txt
+          cp src/ggml/LICENSE dist/LICENSE-ggml.txt
+          (cd dist && zip -qry ../sd-darwin-${{ matrix.arch }}.zip .)
+      - uses: actions/upload-artifact@v4
+        with: { name: sd-darwin-${{ matrix.arch }}, path: sd-darwin-*.zip }
+
+  linux:
+    name: sd-${{ matrix.label }}-linux
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: cuda12-x64, runner: ubuntu-22.04, cuda: "12.4.0", flags: "-DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=all-major" }
+          - { label: cuda13-x64, runner: ubuntu-22.04, cuda: "13.3.1", flags: "-DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real" }
+          - { label: cpu-arm64, runner: ubuntu-24.04-arm, cuda: "", flags: "" }
+          - { label: sycl-x64, runner: ubuntu-22.04, cuda: "", flags: "-DSD_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx" }
+    steps:
+      - name: free disk space (CUDA and oneAPI are large)
+        if: matrix.cuda != '' || matrix.label == 'sycl-x64'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: CUDA toolkit ${{ matrix.cuda }}
+        if: matrix.cuda != ''
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "nvtx"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+      - name: Intel oneAPI (SYCL)
+        if: matrix.label == 'sycl-x64'
+        run: |
+          set -euo pipefail
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/oneapi.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl-devel
+      - name: fetch the pinned source, with its submodules
+        run: |
+          set -euo pipefail
+          git clone --recursive --quiet https://github.com/leejet/stable-diffusion.cpp src
+          git -C src checkout --quiet "${{ inputs.commit }}"
+          git -C src submodule update --init --recursive --quiet
+          git -C src rev-parse HEAD
+      - name: configure and build
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.label }}" = "sycl-x64" ]; then source /opt/intel/oneapi/setvars.sh --force; fi
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_EXAMPLES=OFF \
+            -DGGML_NATIVE=OFF ${{ matrix.flags }}
+          cmake --build build --config Release -j"$(nproc)"
+      - name: collect and PROVE it is what it says
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find build -name '*.so*' -exec cp -P {} dist/ \;
+          sudo apt-get install -y -qq patchelf >/dev/null
+          find dist -maxdepth 1 -type f -name '*.so*' -exec patchelf --set-rpath '$ORIGIN' {} \;
+          ls -la dist
+          test -f dist/libstable-diffusion.so || { echo "libstable-diffusion.so was not produced"; exit 1; }
+          case "${{ matrix.label }}" in
+            cuda*)
+              ldd dist/*.so | grep -qiE "cudart|cublas" || { echo "NO CUDA LIBRARY IS LINKED — a CPU build with a CUDA label"; exit 1; }
+              for lib in libcudart libcublas libcublasLt; do
+                find "${CUDA_PATH:-/usr/local/cuda}" -name "${lib}.so.*" -exec cp -n {} dist/ \; 2>/dev/null || true
+              done ;;
+            sycl*)
+              ldd dist/*.so | grep -qiE "libsycl|libsvml|libmkl" || { echo "NO SYCL LIBRARY IS LINKED"; exit 1; }
+              source /opt/intel/oneapi/setvars.sh --force >/dev/null
+              # The oneAPI runtime a customer's machine does not have: shipped beside the engine, as CUDA's is.
+              for lib in libsycl libsvml libimf libirng libintlc libur_loader libur_adapter_level_zero libumf libtcm libtcm_debug \
+                libmkl_sycl_blas libmkl_intel_ilp64 libmkl_tbb_thread libmkl_core libtbb libOpenCL; do
+                for d in $(echo "$LD_LIBRARY_PATH" | tr ':' ' '); do find "$d" -maxdepth 1 -name "${lib}.so*" -exec cp -Pn {} dist/ \; 2>/dev/null || true; done
+              done ;;
+            cpu-arm64)
+              file dist/libstable-diffusion.so | grep -qiE "aarch64" || { echo "NOT an arm64 binary"; exit 1; } ;;
+          esac
+          MISSING=$(cd / && ldd "$GITHUB_WORKSPACE"/dist/libstable-diffusion.so 2>/dev/null | grep 'not found' \
+            | grep -vE 'libcuda\.so\.1|libgomp\.so\.1|libze_loader|libOpenCL' | sort -u || true)
+          [ -z "$MISSING" ] || { echo "🔴 a needed library is not in the package:"; echo "$MISSING"; exit 1; }
+          printf '%s\n' '#include <dlfcn.h>' '#include <stdio.h>' \
+            'int main(int c,char**v){void*h=dlopen(v[1],RTLD_NOW|RTLD_LOCAL);if(!h){fprintf(stderr,"%s\n",dlerror());return 1;}' \
+            'const char*(*f)(void)=(const char*(*)(void))dlsym(h,"sd_commit");printf("dlopen ok, commit %s\n",f?f():"?");return 0;}' > /tmp/o.c
+          cc -o /tmp/o /tmp/o.c -ldl
+          OPENERR=$( cd / && /tmp/o "$GITHUB_WORKSPACE/dist/libstable-diffusion.so" 2>&1 ) || {
+            case "$OPENERR" in
+              *libcuda.so.1*|*libgomp.so.1*|*libze_loader*|*libOpenCL*) echo "opened as far as this machine can (no GPU driver here): $OPENERR" ;;
+              *) echo "🔴 libstable-diffusion.so does not load: $OPENERR"; exit 1 ;;
+            esac
+          }
+          echo "$OPENERR"
+          cp src/LICENSE dist/LICENSE.txt
+          cp src/ggml/LICENSE dist/LICENSE-ggml.txt
+          tar czf sd-${{ matrix.label }}-linux.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with: { name: sd-${{ matrix.label }}-linux, path: sd-*-linux.tar.gz }
+
+  windows-arm64:
+    name: sd-cpu-arm64-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: llvm-mingw toolchain (pinned)
+        run: |
+          set -euo pipefail
+          LLVM_MINGW=llvm-mingw-20260826-ucrt-ubuntu-22.04-x86_64
+          curl -fsSL --retry 3 -o llvm-mingw.tar.xz "https://github.com/mstorsjo/llvm-mingw/releases/download/20260826/${LLVM_MINGW}.tar.xz"
+          shasum -a 256 llvm-mingw.tar.xz
+          sudo tar xJf llvm-mingw.tar.xz -C /opt
+          echo "/opt/${LLVM_MINGW}/bin" >> "$GITHUB_PATH"
+      - name: fetch the pinned source, with its submodules
+        run: |
+          set -euo pipefail
+          git clone --recursive --quiet https://github.com/leejet/stable-diffusion.cpp src
+          git -C src checkout --quiet "${{ inputs.commit }}"
+          git -C src submodule update --init --recursive --quiet
+          git -C src rev-parse HEAD
+      - name: configure and build
+        run: |
+          set -euo pipefail
+          cmake -S src -B build -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 \
+            -DCMAKE_C_COMPILER=aarch64-w64-mingw32-clang -DCMAKE_CXX_COMPILER=aarch64-w64-mingw32-clang++ \
+            -DCMAKE_RC_COMPILER=aarch64-w64-mingw32-windres -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_BUILD_EXAMPLES=OFF -DGGML_NATIVE=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++ -Wl,-Bstatic -lc++ -lunwind -Wl,-Bdynamic"
+          cmake --build build --config Release -j"$(nproc)"
+      - name: collect and PROVE it loads
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find build -name '*.dll' -exec cp {} dist/ \;
+          # mingw names it libstable-diffusion.dll; upstream's Windows builds — and the product — name it stable-diffusion.dll.
+          [ -f dist/libstable-diffusion.dll ] && mv dist/libstable-diffusion.dll dist/stable-diffusion.dll
+          test -f dist/stable-diffusion.dll || { echo "stable-diffusion.dll was not produced"; exit 1; }
+          file dist/stable-diffusion.dll | grep -qiE "aarch64|arm64" || { echo "NOT an ARM64 binary"; exit 1; }
+          llvm-readobj --coff-imports dist/stable-diffusion.dll | awk -F': *' '/^ *Name:/ {print $2}' | tr -d '\r' | sort -u > /tmp/imports.txt
+          cat /tmp/imports.txt
+          missing=0
+          while read -r dep; do
+            [ -z "$dep" ] && continue
+            case "$(echo "$dep" | tr 'A-Z' 'a-z')" in
+              kernel32.dll|user32.dll|advapi32.dll|msvcrt.dll|ucrtbase.dll|api-ms-*|ws2_32.dll|ole32.dll|shell32.dll|bcrypt.dll|crypt32.dll|winmm.dll|powrprof.dll|dbghelp.dll|version.dll|iphlpapi.dll|secur32.dll|ntdll.dll) continue ;;
+            esac
+            [ -f "dist/$dep" ] || { echo "MISSING DEPENDENCY: $dep"; missing=1; }
+          done < /tmp/imports.txt
+          [ "$missing" -eq 0 ] || exit 1
+          cp src/LICENSE dist/LICENSE.txt
+          cp src/ggml/LICENSE dist/LICENSE-ggml.txt
+          (cd dist && zip -qr ../sd-cpu-arm64-windows.zip .)
+      - uses: actions/upload-artifact@v4
+        with: { name: sd-cpu-arm64-windows, path: sd-cpu-arm64-windows.zip }
+
+  # 🔴 c2patool — THE CONTENT CREDENTIALS SIGNER — FOR ARM. Its maker ships macOS (universal), Linux x64 and Windows x64
+  # only, so a Linux ARM or Windows ARM machine would make pictures it cannot sign. Built from the maker's own tag.
+  c2patool:
+    name: c2patool-${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: linux-arm64, runner: ubuntu-24.04-arm, exe: c2patool, pack: tar }
+          - { label: windows-arm64, runner: windows-11-arm, exe: c2patool.exe, pack: zip }
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build c2patool ${{ inputs.c2patool_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch "c2patool-v${{ inputs.c2patool_version }}" https://github.com/contentauth/c2pa-rs src
+          git -C src rev-parse HEAD
+          cd src && cargo build --release -p c2patool --locked
+          ls -la target/release/
+      - name: collect and PROVE it runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/c2patool
+          cp "src/target/release/${{ matrix.exe }}" dist/c2patool/
+          "./dist/c2patool/${{ matrix.exe }}" --version
+          cp src/LICENSE-MIT dist/c2patool/LICENSE-MIT.txt
+          cp src/LICENSE-APACHE dist/c2patool/LICENSE-APACHE.txt
+          if [ "${{ matrix.pack }}" = "tar" ]; then
+            file "dist/c2patool/${{ matrix.exe }}" | grep -qi aarch64 || { echo "NOT an arm64 binary"; exit 1; }
+            tar czf c2patool-${{ matrix.label }}.tar.gz -C dist .
+          else
+            (cd dist && 7z a -tzip ../c2patool-${{ matrix.label }}.zip . >/dev/null)
+          fi
+      - uses: actions/upload-artifact@v4
+        with: { name: c2patool-${{ matrix.label }}, path: "c2patool-${{ matrix.label }}.*" }
+
+  publish:
+    needs: [mac, linux, windows-arm64, c2patool]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: publish (each asset once; a version identifies bytes)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          TAG="sdcpp-${{ inputs.release }}-$(echo '${{ inputs.commit }}' | cut -c1-7)"
+          [ -n "${{ inputs.revision }}" ] && TAG="${TAG}-${{ inputs.revision }}"
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || gh release create "$TAG" \
+            --title "stable-diffusion.cpp ${{ inputs.release }} ($(echo '${{ inputs.commit }}' | cut -c1-7)) and c2patool ${{ inputs.c2patool_version }} for ARM" \
+            --notes "MasterTask's picture engine for the platforms its maker does not publish — macOS 13.3+ (arm64, x64), Linux CUDA 12, CUDA 13, arm64 and SYCL, Windows arm64 — built from leejet/stable-diffusion.cpp at commit ${{ inputs.commit }}, and c2patool ${{ inputs.c2patool_version }} (contentauth/c2pa-rs) for Linux and Windows arm64. Shared libraries; each job's log records the exact source commit and proves the architecture, the minimum OS and that the library loads." \
+            --repo "${{ github.repository }}"
+          EXISTING=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq '.assets[].name')
+          for f in dist/*; do
+            n=$(basename "$f")
+            if echo "$EXISTING" | grep -qx "$n"; then echo "kept $n (never replaced)"; continue; fi
+            for i in 1 2 3; do gh release upload "$TAG" "$f" --repo "${{ github.repository }}" && break || sleep 10; done
+          done
