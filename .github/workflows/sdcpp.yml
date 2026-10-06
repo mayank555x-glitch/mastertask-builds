@@ -90,7 +90,9 @@ jobs:
           cp src/ggml/LICENSE dist/LICENSE-ggml.txt
           (cd dist && zip -qry ../sd-darwin-${{ matrix.arch }}.zip .)
       - uses: actions/upload-artifact@v4
-        with: { name: sd-darwin-${{ matrix.arch }}, path: sd-darwin-*.zip }
+        with:
+          name: sd-darwin-${{ matrix.arch }}
+          path: sd-darwin-*.zip
 
   linux:
     name: sd-${{ matrix.label }}-linux
@@ -99,10 +101,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: cuda12-x64, runner: ubuntu-22.04, cuda: "12.4.0", flags: "-DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=all-major" }
-          - { label: cuda13-x64, runner: ubuntu-22.04, cuda: "13.3.1", flags: "-DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real" }
-          - { label: cpu-arm64, runner: ubuntu-24.04-arm, cuda: "", flags: "" }
-          - { label: sycl-x64, runner: ubuntu-22.04, cuda: "", flags: "-DSD_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx" }
+          # 🔴 THE CUDA ARCHITECTURES ARE THEIR OWN FIELD AND QUOTED WHERE USED: the list is `;`-separated, which an
+          # unquoted shell word reads as the end of the cmake command. CUDA 13 uses ggml's own list (cuda-linux.yml).
+          - { label: cuda12-x64, runner: ubuntu-22.04, cuda: "12.4.0", flags: "-DSD_CUDA=ON", cuda_archs: "all-major" }
+          - { label: cuda13-x64, runner: ubuntu-22.04, cuda: "13.3.1", flags: "-DSD_CUDA=ON", cuda_archs: "75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real" }
+          - { label: cpu-arm64, runner: ubuntu-24.04-arm, cuda: "", flags: "", cuda_archs: "" }
+          - { label: sycl-x64, runner: ubuntu-22.04, cuda: "", flags: "-DSD_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx", cuda_archs: "" }
     steps:
       - name: free disk space (CUDA and oneAPI are large)
         if: matrix.cuda != '' || matrix.label == 'sycl-x64'
@@ -134,8 +138,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.label }}" = "sycl-x64" ]; then source /opt/intel/oneapi/setvars.sh --force; fi
-          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_EXAMPLES=OFF \
-            -DGGML_NATIVE=OFF ${{ matrix.flags }}
+          ARCHS='${{ matrix.cuda_archs }}'
+          set -- -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_EXAMPLES=OFF -DGGML_NATIVE=OFF
+          [ -n "$ARCHS" ] && set -- "$@" "-DCMAKE_CUDA_ARCHITECTURES=$ARCHS"
+          cmake -S src -B build "$@" ${{ matrix.flags }}
           cmake --build build --config Release -j"$(nproc)"
       - name: collect and PROVE it is what it says
         run: |
@@ -181,7 +187,9 @@ jobs:
           cp src/ggml/LICENSE dist/LICENSE-ggml.txt
           tar czf sd-${{ matrix.label }}-linux.tar.gz -C dist .
       - uses: actions/upload-artifact@v4
-        with: { name: sd-${{ matrix.label }}-linux, path: sd-*-linux.tar.gz }
+        with:
+          name: sd-${{ matrix.label }}-linux
+          path: sd-*-linux.tar.gz
 
   windows-arm64:
     name: sd-cpu-arm64-windows
@@ -274,7 +282,9 @@ jobs:
             (cd dist && 7z a -tzip ../c2patool-${{ matrix.label }}.zip . >/dev/null)
           fi
       - uses: actions/upload-artifact@v4
-        with: { name: c2patool-${{ matrix.label }}, path: "c2patool-${{ matrix.label }}.*" }
+        with:
+          name: c2patool-${{ matrix.label }}
+          path: "c2patool-${{ matrix.label }}.*"
 
   publish:
     needs: [mac, linux, windows-arm64, c2patool]
