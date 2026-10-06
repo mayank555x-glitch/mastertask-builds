@@ -137,7 +137,8 @@ jobs:
       - name: configure and build
         run: |
           set -euo pipefail
-          if [ "${{ matrix.label }}" = "sycl-x64" ]; then source /opt/intel/oneapi/setvars.sh --force; fi
+          # 🔴 oneAPI's setvars.sh reads variables it never set, so it runs with `-u` off and `-u` comes back after.
+          if [ "${{ matrix.label }}" = "sycl-x64" ]; then set +u; source /opt/intel/oneapi/setvars.sh --force; set -u; fi
           ARCHS='${{ matrix.cuda_archs }}'
           set -- -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_EXAMPLES=OFF -DGGML_NATIVE=OFF
           [ -n "$ARCHS" ] && set -- "$@" "-DCMAKE_CUDA_ARCHITECTURES=$ARCHS"
@@ -160,7 +161,7 @@ jobs:
               done ;;
             sycl*)
               ldd dist/*.so | grep -qiE "libsycl|libsvml|libmkl" || { echo "NO SYCL LIBRARY IS LINKED"; exit 1; }
-              source /opt/intel/oneapi/setvars.sh --force >/dev/null
+              set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null; set -u
               # The oneAPI runtime a customer's machine does not have: shipped beside the engine, as CUDA's is.
               for lib in libsycl libsvml libimf libirng libintlc libur_loader libur_adapter_level_zero libumf libtcm libtcm_debug \
                 libmkl_sycl_blas libmkl_intel_ilp64 libmkl_tbb_thread libmkl_core libtbb libOpenCL; do
@@ -210,13 +211,14 @@ jobs:
           git -C src checkout --quiet "${{ inputs.commit }}"
           git -C src submodule update --init --recursive --quiet
           git -C src rev-parse HEAD
+      # 🔴 NO OPENMP: llvm-mingw's OpenMP is libomp.dll, which no Windows machine has; ggml's own thread pool serves.
       - name: configure and build
         run: |
           set -euo pipefail
           cmake -S src -B build -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 \
             -DCMAKE_C_COMPILER=aarch64-w64-mingw32-clang -DCMAKE_CXX_COMPILER=aarch64-w64-mingw32-clang++ \
             -DCMAKE_RC_COMPILER=aarch64-w64-mingw32-windres -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=ON \
-            -DSD_BUILD_EXAMPLES=OFF -DGGML_NATIVE=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DSD_BUILD_EXAMPLES=OFF -DGGML_NATIVE=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_OPENMP=OFF \
             -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++ -Wl,-Bstatic -lc++ -lunwind -Wl,-Bdynamic"
           cmake --build build --config Release -j"$(nproc)"
       - name: collect and PROVE it loads
@@ -258,6 +260,13 @@ jobs:
           - { label: windows-arm64, runner: windows-11-arm, exe: c2patool.exe, pack: zip }
     steps:
       - uses: dtolnay/rust-toolchain@stable
+      # 🔴 OpenSSL is built from source and its Configure needs a COMPLETE Perl; Git Bash's Perl lacks modules it loads.
+      - name: a complete Perl (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path C:\Strawberry\perl\bin\perl.exe)) { choco install strawberryperl -y --no-progress }
+          "OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: build c2patool ${{ inputs.c2patool_version }}
         shell: bash
         run: |
